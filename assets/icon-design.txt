@@ -1,0 +1,10 @@
+Sentinel Desk application icon
+Generated using the built-in image_gen tool (transparent background).
+
+Final prompt:
+Use case: logo-brand. Asset type: Windows desktop application icon for Sentinel Desk, a public exposure and vulnerability monitoring app. Create one polished square icon: a bold indigo-violet shield with an integrated white magnifying glass, conveying security search and watchfulness. Match an understated light UI with accent #5262d8. Simple strong silhouette, balanced optical weight, generous thick strokes readable at 16 and 32 pixels, gently rounded shield edges, subtle dimensional polish without intricate details. Single centered mark occupying 86 percent of canvas, actual transparent background outside the shield, no enclosing background tile, no lettering, no words, no watermark, no mockup, no extra objects. Square high resolution.
+
+sentinel.png: original generated artwork.
+sentinel-48.png: 48 px sidebar logo.
+sentinel.ico: Windows icon containing 16, 20, 24, 32, 40, 48, 64, 128 and 256 px images.
+PNG resizing and ICO format conversion performed using Pillow.
