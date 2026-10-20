@@ -1,13 +1,17 @@
 """Optional JS rendering with installed Edge and an isolated temporary profile."""
 import os
+import json
 from pathlib import Path
+import socket
 import subprocess
 import tempfile
 import time
 from urllib.parse import parse_qs, urlsplit
+from urllib.request import build_opener, ProxyHandler
 
 from .devtools import DevTools, DevToolsError
 from .search_html import parse_search_html, SearchPageError
+from .captcha_runtime import attempt_captcha
 
 
 class RenderError(ValueError):
@@ -24,6 +28,25 @@ def edge_path():
             if candidate.is_file():
                 return str(candidate)
     raise RenderError("Google 검색에 JavaScript 렌더링이 필요합니다. Microsoft Edge를 설치하거나 SerpApi를 선택하세요.")
+
+
+def local_debugger_endpoint(port):
+    """Discover only the explicitly allocated loopback browser endpoint."""
+    opener = build_opener(ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/json/version", timeout=0.5) as response:
+        payload = response.read(65537)
+    if len(payload) > 65536:
+        raise ValueError("브라우저 연결 메타데이터 크기 초과")
+    metadata = json.loads(payload)
+    if not isinstance(metadata, dict):
+        raise ValueError("브라우저 연결 메타데이터 형식 오류")
+    endpoint = metadata.get("webSocketDebuggerUrl", "")
+    parts = urlsplit(endpoint)
+    if (parts.scheme != "ws" or parts.hostname != "127.0.0.1" or parts.port != port or
+            parts.username or parts.password or parts.query or parts.fragment or
+            not parts.path.startswith("/devtools/browser/")):
+        raise ValueError("앱 전용 로컬 브라우저 연결 정보가 아닙니다.")
+    return endpoint
 
 
 def render_search(url, stop):
@@ -65,11 +88,18 @@ def render_search(url, stop):
 
 class SearchSession:
     """Reuse an app-owned profile; let a human complete challenges in manual runs."""
-    def __init__(self, directory, engine, stop, interactive=False, progress=None):
+    def __init__(self, directory, engine, stop, interactive=False, progress=None, headless=False):
         self.directory = Path(directory) / "browser-profiles" / engine
         self.engine, self.stop = engine, stop
         self.interactive, self.progress = interactive, progress or (lambda _message: None)
+        # Authentication waiting and browser rendering are independent. Baidu
+        # rejected headless sessions even when the same profile worked headed.
+        self.headless = headless
         self.process = self.client = self.session = None
+        self.endpoint = self.target_id = None
+        self.captcha_attempts = []
+        self.auto_captcha = True
+        self.captcha_artifacts = None
 
     def start(self):
         if self.client:
@@ -77,10 +107,16 @@ class SearchSession:
         self.directory.mkdir(parents=True, exist_ok=True)
         portfile = self.directory / "DevToolsActivePort"
         portfile.unlink(missing_ok=True)
+        # Chromium's port=0 mode sets navigator.webdriver even in a normal window.
+        # Use a normal explicit loopback debugging port; don't override page APIs.
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
         arguments = [edge_path(), "--no-first-run", "--no-default-browser-check", "--disable-extensions",
-                     "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
+                     "--window-size=1280,900",
+                     "--remote-debugging-address=127.0.0.1", f"--remote-debugging-port={port}",
                      "--user-data-dir=" + str(self.directory.resolve()), "--new-window", "about:blank"]
-        if not self.interactive:
+        if self.headless:
             arguments.insert(1, "--headless")
         self.process = subprocess.Popen(arguments, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=0 if self.interactive else getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -91,14 +127,16 @@ class SearchSession:
                     raise RenderError("사용자가 수집을 중지했습니다.", "cancelled")
                 if self.process.poll() is not None:
                     raise RenderError("검색 브라우저를 시작하지 못했습니다. 앱 전용 Edge 창을 닫고 다시 실행하세요.")
-                if portfile.exists():
-                    lines = portfile.read_text(encoding="utf-8").splitlines()
-                    if len(lines) >= 2 and lines[0].isdigit() and lines[1].startswith("/devtools/browser/"):
-                        self.client = DevTools(f"ws://127.0.0.1:{int(lines[0])}{lines[1]}")
-                        target = self.client.call("Target.createTarget", dict(url="about:blank"))
-                        self.session = self.client.call("Target.attachToTarget", dict(targetId=target["targetId"], flatten=True))["sessionId"]
-                        return
-                self.stop.wait(0.1)
+                try:
+                    self.endpoint = local_debugger_endpoint(port)
+                except (OSError, ValueError):
+                    self.stop.wait(0.1)
+                    continue
+                self.client = DevTools(self.endpoint)
+                target = self.client.call("Target.createTarget", dict(url="about:blank"))
+                self.target_id = target["targetId"]
+                self.session = self.client.call("Target.attachToTarget", dict(targetId=target["targetId"], flatten=True))["sessionId"]
+                return
             raise RenderError("브라우저 연결 시간이 초과되었습니다. Edge 원격 디버깅 허용 정책을 확인하세요.")
         except Exception:
             self.close()
@@ -123,6 +161,7 @@ class SearchSession:
     def results(self, url, offset=0, auth_timeout=300):
         if self.stop.is_set():
             raise RenderError("사용자가 수집을 중지했습니다.", "cancelled")
+        self.captcha_attempts = []
         expected = urlsplit(url)
         expected_host = "www.google.com" if self.engine == "google" else "www.baidu.com"
         if expected.scheme != "https" or expected.hostname != expected_host or expected.path != ("/search" if self.engine == "google" else "/s"):
@@ -136,6 +175,8 @@ class SearchSession:
             auth_deadline = None
             last_error = None
             stable = None
+            attempted = False
+            approval_deadline = None
             while not self.stop.is_set():
                 snapshot = self.snapshot()
                 if snapshot.get("oversized"):
@@ -165,8 +206,25 @@ class SearchSession:
                     stable, last_error = None, exc
                     challenge = exc.code == "blocked" or current.path.startswith("/sorry") or current.hostname in ("wappass.baidu.com", "passport.baidu.com", "consent.google.com")
                     if challenge:
+                        if not attempted and self.auto_captcha and self.endpoint and self.target_id:
+                            attempted = True
+                            self.progress(f"{self.engine}: 로컬 CAPTCHA 모델 처리 중")
+                            outcome = attempt_captcha(self.engine, self.endpoint, self.target_id, self.stop, self.captcha_artifacts)
+                            self.captcha_attempts.append(outcome)
+                            if outcome["status"] == "cancelled":
+                                raise RenderError("사용자가 수집을 중지했습니다.", "cancelled")
+                            # Only parsing the original query's search results confirms completion.
+                            if outcome["status"] in ("widget_verified", "navigation_resumed"):
+                                load_deadline = time.monotonic() + 20
+                                approval_deadline = load_deadline
+                                continue
+                            self.progress(f"{self.engine}: 자동 인증 {outcome['status']} · " + str(outcome.get("reason", "직접 인증 필요")))
+                        if approval_deadline is not None and time.monotonic() < approval_deadline:
+                            self.stop.wait(0.25)
+                            continue
                         if not self.interactive:
-                            raise RenderError("브라우저 인증이 필요합니다. 수집 실행을 직접 눌러 열린 Edge에서 인증을 완료하세요. 예약 수집은 인증을 기다리지 않습니다.", "auth_required")
+                            detail = self.captcha_attempts[-1].get("reason", self.captcha_attempts[-1]["status"]) if attempted and self.captcha_attempts else "자동 처리 불가"
+                            raise RenderError("브라우저 인증이 필요합니다. " + str(detail) + " · 수집 실행을 직접 눌러 Edge에서 인증하세요.", "auth_required")
                         if auth_deadline is None:
                             auth_deadline = time.monotonic() + auth_timeout
                             self.progress(f"{self.engine}: 인증 대기 · 열린 앱 전용 Edge에서 CAPTCHA/동의를 완료하세요 (최대 {auth_timeout // 60}분)")

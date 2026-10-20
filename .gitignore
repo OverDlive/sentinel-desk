@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 test-artifacts/
 .build-tools/
+.captcha-tools/
 build/
 *.spec
 dist/

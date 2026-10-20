@@ -23,6 +23,7 @@ class DevTools:
         self.socket = socket.create_connection((parts.hostname, parts.port), timeout=5)
         self.buffer = b""
         self.sequence = 0
+        self.event_handler = None
         try:
             key = base64.b64encode(os.urandom(16)).decode("ascii")
             request = (f"GET {parts.path} HTTP/1.1\r\nHost: {parts.hostname}:{parts.port}\r\n"
@@ -102,6 +103,8 @@ class DevTools:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             response = self.receive(deadline)
+            if response.get("method") and self.event_handler:
+                self.event_handler(response)
             if response.get("id") == self.sequence:
                 if "error" in response:
                     raise DevToolsError("검색 브라우저 명령을 처리하지 못했습니다.")

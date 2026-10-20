@@ -4,7 +4,7 @@
 
 ## 시작하기
 
-1. 배포 ZIP을 풀고 `SentinelDesk.exe`를 실행합니다.
+1. 배포 ZIP 전체를 풀고 `SentinelDesk.exe`를 실행합니다. 자동 CAPTCHA 모델은 실행 파일 옆의 `captcha-runtime` 폴더를 함께 유지해야 합니다.
 2. 첫 화면은 **데모 보기**입니다. 합성 예시이며 실제 기관의 결과가 아닙니다.
 3. **점검 대상 → 점검 대상 등록**에서 기관명, 도메인, 키워드, IP/CIDR 등을 등록합니다. 도메인은 `https://` 없이 입력합니다.
 4. **API 연동 → Google 또는 Baidu → HTML 직접 수집 (키 불필요)**을 선택하고 **실제 수집에 사용**을 켠 뒤 저장합니다. 다른 API 수집은 해당 키가 필요합니다. CISA KEV도 키 없이 사용할 수 있습니다.
@@ -61,17 +61,38 @@ US-CERT의 과거 경보·분석 보고서 경로와 [CISA 통합 권고](https:
 
 **Google / Baidu 직접 수집:** API 연동에서 엔진을 선택하고 **HTML 직접 수집 (키 불필요) → 실제 수집에 사용 → 연동 설정 저장**을 누릅니다. 상단에서 **실제 수집 → 수집 실행**을 누르면 기존 검색 규칙을 실행하고, 제목·링크·요약을 검색 결과·후보 화면에 표시합니다. 신규·기존 키 미등록 설정의 기본 방식입니다. 기존 SerpApi 키가 있는 설정은 방식·키·활성 상태를 보존하므로 직접 수집으로 바꾸려면 수집 방식을 선택해 저장하세요.
 
-구현 순서는 고정된 엔진 검색 URL 생성 → 앱 전용 Edge 세션에서 검색 → 인증 필요 시 직접 인증 대기 → 두 번 연속 안정된 HTML 확인 → 엔진별 결과 파싱 → 광고·중복 제외 → 기존 대상 관련성 분류 → SQLite 저장·화면 표시입니다. Python 표준 라이브러리와 Edge DevTools Protocol을 사용합니다. 검색 결과의 원문 사이트는 자동 방문하지 않습니다.
+구현 순서는 고정된 엔진 검색 URL 생성 → 앱 전용 Edge 세션에서 검색 → CAPTCHA 발견 시 로컬 모델 작업 프로세스 실행 → 사이트 인증 승인 확인 → 두 번 연속 안정된 검색 HTML 확인 → 엔진별 결과 파싱 → 관련성 분류 → SQLite 저장·화면 표시입니다. 모델 인식 결과나 CAPTCHA 위젯의 성공 표시만으로 수집 성공을 기록하지 않습니다. 요청한 원래 검색어의 결과 HTML을 받아야 성공입니다. 검색 결과의 원문 사이트는 자동 방문하지 않습니다.
 
 - 직접 수집 검색 사이에는 최소 10초 간격을 둡니다. 규칙당 1~3페이지, 기존 일일 한도·실행당 규칙 수 제한을 적용합니다. 하루 한 번 실행하더라도 규칙 수×페이지 수만큼 요청할 수 있습니다. 기본 실행당 40규칙 한도로 모든 규칙을 하루에 처리하지 못하면 다음 실행에 순환합니다.
-- **수집 실행**을 직접 누르면 앱 전용 Edge 창이 열립니다. CAPTCHA·동의·Baidu 확인 화면이 나오면 그 창에서 직접 완료하세요. 프로그램 하단에 **인증 대기**가 표시되며 최대 5분 기다린 뒤 같은 검색의 수집을 자동 재개합니다. 인증이 필요 없으면 그대로 수집합니다. 검색어를 직접 바꾸거나 창을 닫으면 해당 엔진 수집이 중단됩니다.
-- **예약 실행**은 창 없는 Edge로 실행합니다. 인증이 필요하면 **브라우저 인증 필요**를 기록하고 해당 엔진의 남은 규칙을 건너뜁니다. 이후 수집 실행을 직접 눌러 인증하세요. 인증 상태 재사용은 검색엔진 정책에 따라 만료되거나 무효화될 수 있습니다. CAPTCHA의 완전 자동 해제는 제공하지 않습니다. 무인 수집이 필요하면 기존 SerpApi 방식을 선택할 수 있습니다(별도 키 필요).
+- **수집 실행**을 직접 누르면 앱 전용 Edge 창이 열립니다. Google reCAPTCHA v2는 `Breaking-reCAPTCHAv2`의 원본 분류·분할 체크포인트를, Baidu 회전형은 ConvNeXt와 대체 모델 `RotNetR v0.5.1`을 CPU에서 실행합니다. 모델 준비 상태는 API 연동 화면에서 확인합니다. 모델 작업은 최대 115초이며 수집 중지 버튼으로 취소할 수 있습니다. 지원하지 않는 유형·모델 실패·동의 화면은 기존 직접 인증으로 이어집니다(최대 5분).
+- **예약 실행**도 앱 전용 일반 Edge 창에서 동일한 로컬 모델을 실행합니다. 창 없는 실행에서 Baidu 인증 거부가 관찰되어 브라우저 표시 방식과 사람의 인증 대기 여부를 분리했습니다. 예약 실행은 자동 인증이 실패하면 사람의 입력을 기다리지 않고 **브라우저 인증 필요**를 기록하며 해당 엔진의 남은 규칙을 건너뜁니다. 일반 창에서도 거부 사례가 있으므로 표시 방식만으로 인증 성공을 보장하지 않습니다. 지원하지 않는 CAPTCHA, 이미지 미로딩, 이미지 교체 지연, 사이트의 보안 위험 거부를 구분합니다.
 - 엔진별 전용 프로필은 데이터 폴더의 `browser-profiles/google`, `browser-profiles/baidu`에 저장합니다. 개인 Edge 프로필은 사용하지 않습니다. 같은 실행 내에서는 브라우저와 탭을 재사용하고 실행 종료 시 닫습니다. 프로필의 쿠키·사이트 저장소는 다음 실행에서도 유지합니다. 일반 로딩은 최대 40초, HTML은 최대 8MiB입니다. 앱은 `127.0.0.1`의 임시 디버깅 포트로 자신이 실행한 브라우저만 제어합니다. 브라우저의 하위 리소스·리디렉션 요청은 앱의 검색 탐색 카운터에 포함하지 않습니다.
 - 접근 거부는 **접근 차단**, 모르는 HTML 구조는 **응답 오류**로 기록합니다. 정상적인 검색 0건과 구분하며 유료 API로 자동 전환하지 않습니다.
 - 최종 URL이 HTML에 있으면 사용하고, 불투명한 Google `/goto`·Baidu `/link`는 그대로 저장합니다. 화면에 표시된 출처 주소를 증거에 남기며 최종 목적지 미확인·낮은 신뢰도로 분류합니다. 중계 URL이 바뀌면 별도 후보로 기록될 수 있습니다.
 - 하루 한 번 자동 실행하려면 **자동 수집 설정**에서 주기를 **1440분**으로 저장합니다. 앱이 실행 중일 때만 동작합니다. 직접 수집 활성화와 자동 실행은 사용자 설정으로 켜야 합니다.
 
 **SerpApi 선택 / Zone-H·XSSed:** API 연동에서 Google/Baidu는 **SerpApi (API 키 필요)**를 선택하고, 원하는 항목의 **SerpApi API 키**를 입력한 뒤 **실제 수집에 사용 → 연동 설정 저장**을 누릅니다. Google/Baidu 자체 API 키가 아닌 [SerpApi](https://serpapi.com/) 계정의 키입니다. 동일한 키를 네 항목에 각각 등록할 수 있습니다. 이 방식에서는 키·검색어가 중계 서비스 SerpApi로 전송됩니다. 직접 수집은 저장된 SerpApi 키를 복호화하거나 전송하지 않습니다. 계정 크레딧은 공유되며 앱의 일일 호출 상한은 항목별로 적용됩니다.
+
+### CAPTCHA 모델 구현·검증
+
+- Google: 현재 앱이 만든 검색 탭의 reCAPTCHA 프레임에만 연결합니다. 원본 분류 모델의 실제 클래스 이름을 읽어 영문·한국어·중문 지시문을 대응하고, 3×3 정적·동적 이미지와 4×4 분할 유형을 처리합니다. 원본 분류 임계값 0.2와 텐서 전처리를 적용하며 3×3에는 같은 설치에 포함된 분할 모델의 보조 탐지를 더합니다. 동적 타일은 정적·동적 선택 표시를 모두 확인해 해제될 때까지 기다리고, 전환 애니메이션·이미지 로딩·주소가 안정된 뒤에만 추론합니다. 최초 이미지 교체 전에도 동일하게 기다리며 추론 중 이미지가 바뀌면 해당 예측을 버립니다. 지원하지 않는 대상이면 새 문제 버튼을 최대 2회 사용합니다. 최대 16회·85초이며 별도 데모 페이지나 VPN 기능은 실행하지 않습니다.
+- Baidu R3: 현재 검색에서 이동한 회전 확인 화면의 원본 이미지를 브라우저에 이미 로드된 리소스에서 읽습니다. 이미지 URL 재요청은 JSON 응답이 반환된 사례가 있어 사용하지 않습니다. ConvNeXt와 RotNetR를 각각 8방향으로 추론하고, 두 예측이 12도 이내이며 RotNetR의 회전 일관성이 0.95 이상일 때만 25% 비중으로 보조합니다. 기본 예측은 ConvNeXt를 유지하며 다음 문제에서 RotNetR·ConvNeXt를 순서대로 시험합니다. RotNetR의 회전 일관성이 낮으면 원본 단일 추론을 사용합니다. 직접 DevTools 입력과 실제 CSS 회전 피드백으로 드래그를 보정합니다. `rotation_error`는 모델이 예측한 목표 각도와 실제 CSS 각도의 차이이며 정답 각도 오차가 아닙니다. 한 작업에서 최대 3개 문제·80초를 처리하고 빈도 제한 메시지에서는 중단합니다.
+- Baidu의 위젯 성공과 검색 사이트의 후속 승인을 구분합니다. 공개 페이지 SDK와 실제 응답에서 위젯 성공 이후 `/cap/c`의 `data.s`가 있어야 검색으로 이동하고, `data.f.reason`이면 새 인증을 요구하는 흐름을 확인했습니다. HTTP 200·최상위 `code: 0`·초록색 성공 표시만으로 수집 성공을 기록하지 않습니다. 실제 원래 검색어의 결과 HTML을 받아 파싱해야 성공입니다. 승인 뒤 화면 전환을 기다리는 유예 시간도 추가했습니다. 로그에는 인증 토큰 값 대신 존재 여부·길이만 남깁니다.
+- 브라우저 실행 시 `--remote-debugging-port=0`이 일반 창에서도 `navigator.webdriver=true`를 설정하는 것을 로컬 비교 시험으로 확인해 명시적인 임시 루프백 포트로 바꿨습니다. JavaScript 속성을 덮어쓰지는 않습니다. 포트 변경만 적용한 시험에서는 여전히 인증 거부가 발생했으므로 단독 해결 원인으로 해석하지 않습니다. [MDN의 webdriver 설명](https://developer.mozilla.org/en-US/docs/Web/API/Navigator/webdriver)도 해당 실행 옵션의 동작을 설명합니다. 서버의 내부 위험 판정 기준은 공개 응답만으로 확정할 수 없습니다.
+- 실행 파일은 별도 `CaptchaWorker.exe`에 JSON 작업을 전달합니다. PyTorch·Ultralytics·Playwright는 모델 프로세스에만 포함합니다. 앱 개인 브라우저 프로필과 API 키를 사용하지 않으며, 외부 CAPTCHA 대행 서비스에 이미지를 보내지 않습니다. 모델 자동 다운로드·런타임 패키지 자동 설치를 실행하지 않습니다.
+- 모델 파일의 SHA-256과 원본 저장소 커밋은 `captcha-runtime/manifest.json`에 기록합니다. 파일 검증 실패·런타임 미설치는 수집 성공으로 처리하지 않습니다. Google의 모듈 직렬화 체크포인트는 설치 기록의 해시와 일치할 때만 로드하며, Baidu는 `weights_only=True`로 읽습니다.
+- **2026-10-20 실제 시험:** Google은 소스 런타임에서 CAPTCHA 이미지 추론·선택·검증 후 원래 `IANA example domain` 검색으로 복귀해 **9건을 수신하고 9건을 SQLite에 저장**한 사례가 있습니다. 그러나 최종 독립 실행 런타임 재시험은 같은 CAPTCHA 상태가 반복되어 **인증 미승인**으로 끝났습니다. 안정적인 자동 통과가 검증된 상태는 아닙니다. Baidu는 CAPTCHA 없는 세션에서 **8건 수신**을 확인했지만, CAPTCHA가 제시된 새 프로필에서는 회전 모델 적용·드래그 후 **사이트 인증 미승인**으로 끝났습니다. Baidu 자동 CAPTCHA 통과 성공으로 표시하지 않습니다.
+- 원본 Baidu 제공 샘플 12장의 각도 오차는 단일 추론 평균 약 7.67도, 8방향 추론 평균 약 5.72도였습니다. 제공 샘플 재현 수치이며 독립 검증 데이터의 정확도나 실제 사이트 통과율이 아닙니다.
+- **R2 당시 결과:** Google 실패 화면에서 분류 모델이 놓친 8번째 소화전 타일을 보조 탐지가 복구했습니다. 수정 과정에서 실제 CAPTCHA가 나온 검색 4회(소스 1회·독립 실행 런타임 3회)를 통과해 각각 9건을 수신했습니다. 최종 배포용 실행 파일도 사람 입력 없이 CAPTCHA 통과 후 9건을 수신했습니다. 같은 프로필의 CAPTCHA 없는 재조회도 9건을 수신했습니다. 이는 짧은 반복 시험 결과이며 장기 운영 통과율은 검증되지 않았습니다. Baidu는 일반 검색 두 차례에서 각각 8건을 수신했지만 CAPTCHA가 나온 검색 네 차례는 인증 거부로 끝났습니다. R2에서는 Baidu 자동 CAPTCHA 통과가 미해결이었습니다.
+- **R3 실제 성공:** 이전에 계속 거부되던 전용 프로필에서 3개 문제를 처리한 뒤 사람 입력 없이 원래 `IANA example domain` 검색으로 복귀해 **8건을 수신**했습니다. 별도 검색 재요청은 사용하지 않았습니다. `revision-3/blocked-profile-requery/report.json`의 `automatic_captcha_pass_and_search: true`와 실제 HTML·화면에 기록했습니다. 폴더 이름과 달리 해당 시험에서는 재조회 옵션의 복구 경로가 실행되지 않았습니다. 수정 중 거부된 시험도 보존하며 한 번의 성공을 장기 운영 통과율로 해석하지 않습니다.
+- R3의 원본 제공 샘플 24장 비교에서 평균 각도 오차는 ConvNeXt 약 8.56도, RotNetR 약 36.19도였습니다. 대체 모델이 항상 더 정확하지 않아 기존 모델을 기본으로 유지하고 일치할 때만 보조하도록 적용했습니다. 제공 샘플은 독립 검증 데이터가 아니며 실제 사이트 통과율도 아닙니다. 전체 비교는 `revision-3/model-comparison.json`에 있습니다.
+- R3 실제 시험·배포 검증 요약은 `test-artifacts/captcha-models/revision-3/validation-summary.json`입니다. `blocked-profile-requery`는 소스 성공, `packaged-live`는 최종 독립 실행 모델 시험, `packaged-inference.json`은 실제 체크포인트 추론 기록입니다. 각 실사이트 시험 폴더에 처리 전·정렬 직후·처리 후 화면과 최종 검색 HTML을 남깁니다.
+- **R3 최종 배포용 재시험의 한계:** 새 프로필의 두 번째 페이지(`pn=10`)에서는 3개 문제 처리 후 위젯 성공이 관찰됐지만 `/cap/c`가 계속 후속 승인을 거부했습니다. 같은 프로필의 원래 첫 페이지(`pn=0`)는 CAPTCHA 없이 8건을 수신했고 앞서 성공한 프로필은 CAPTCHA 없이 9건을 수신했습니다. Google도 CAPTCHA 없이 9건을 수신했습니다. 따라서 최종 배포본의 일반 검색·실제 모델 추론은 확인했으나 **Baidu CAPTCHA 통과의 안정적인 재현은 아직 미해결**입니다. 새 프로필·페이지 조건을 섞은 이 시험들로 통과율을 계산하지 않습니다. 실행 파일 UI 검증은 정상이며 콜백 오류가 없었습니다.
+- R2 보고서: `test-artifacts/captcha-models/revision-2/google-small-object-regression.json`, `revision-2/live/round-1/report.json`(Google CAPTCHA 통과·9건 및 Baidu 일반 검색 8건), `round-3/report.json`(Baidu 동일 프로필 일반 창 재조회 8건), `round-4/report.json`(Google 재조회 9건·Baidu CAPTCHA 거부), `round-6/report.json`(Baidu 원본 이미지 적용·서버 거부). 각 시험 폴더에 처리 전·정렬 직후·거부 후 실제 화면과 토큰을 제외한 인증 응답을 남겼습니다.
+- 최종 배포용 Google 시험은 `revision-2/live/round-9/report.json`, 전체 결과·배포 파일 검증은 `revision-2/validation-summary.json`입니다. `round-7`, `round-8`은 수정 중간의 독립 실행 런타임 성공 기록입니다.
+- 시험 보고서: `test-artifacts/captcha-models/live/report.json`(Google 통과·저장 및 Baidu 일반 검색), `live-fresh/report.json`(Google 최종 독립 실행·Baidu 회전 CAPTCHA 실패), `offline-report.json`(실제 모델 추론), `validation-summary.json`(검증 요약). CAPTCHA 처리 내역은 수집 결과의 증거에도 남깁니다.
+
+모델 원본: [Breaking-reCAPTCHAv2](https://github.com/aplesner/Breaking-reCAPTCHAv2), [rotate-captcha-solver](https://github.com/yixiaowang2001/rotate-captcha-solver), [RotNetR / rotate-captcha-crack](https://github.com/lumina37/rotate-captcha-crack). RotNetR 소스 커밋과 v0.5.1 체크포인트·배포 압축 파일의 SHA-256을 고정하고, 원본 Unlicense를 `captcha-runtime/licenses`에 포함했습니다. 이 배포는 로컬 검증용이며 원본 코드·모델과 관련 의존성의 라이선스는 별도로 확인해야 합니다.
 
 기존 데이터 폴더도 첫 실행 시 새 규칙을 자동 추가합니다. 기존 결과·검토 이력·다른 규칙의 활성 상태를 보존하며 제공자를 자동으로 켜지 않습니다. Zone-H·XSSed는 화면에 **(색인)**으로 표시됩니다. 검색에 색인되지 않은 신고는 수집할 수 없고 0건이 안전함을 뜻하지 않습니다. 신고 URL을 자동 방문하거나 CAPTCHA를 우회하지 않습니다.
 
@@ -116,6 +137,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1 -Python python
 
 배포 결과는 `dist/SentinelDesk.exe`와 `dist/SentinelDesk-v1.0.0-Windows-x64.zip`입니다.
 
+최신 R3 개선 배포본은 `dist/SentinelDesk-ML-R3-v1.0.0-Windows-x64.zip`입니다. 전체를 풀고 `SentinelDesk-ML-R3.exe`를 실행하며 `captcha-runtime` 폴더를 실행 파일 옆에 유지합니다. 기존 실행 파일과 별도로 만들려면 `build.ps1 -OutputName SentinelDesk-ML-R3`를 사용합니다. 실제 CAPTCHA 통과·검색 수신 사례를 확인했으며 모든 인증 문제·향후 세션의 자동 통과를 보장하지는 않습니다.
+
+모델 포함 배포는 `setup-captcha.ps1`로 검증한 원본 커밋·CPU 의존성·모델을 준비하고, `build-captcha.ps1`로 `dist/captcha-runtime`을 생성한 뒤 `build.ps1`을 실행합니다. ZIP에는 해당 런타임이 함께 들어갑니다. CPU용 모델·라이브러리가 포함되어 일반 배포보다 큽니다. 개발 환경은 `.captcha-tools`에 격리하며 원본 커밋·모델 해시는 `manifest.json`에 기록합니다. 현재 소스 실행은 해당 폴더의 가상환경도 사용할 수 있습니다. 다른 위치의 런타임은 `SENTINEL_CAPTCHA_RUNTIME` 환경 변수로 지정합니다. 독립 실행 모델 검사는 `python tests/probe_packaged_captcha.py`입니다.
+
 네트워크 없이 실제 네이티브 화면을 검증하려면:
 
 ```powershell
@@ -137,7 +162,7 @@ python main.py --data-dir .\test-artifacts\ui-data --smoke-ui .\test-artifacts\u
 - [SerpApi Google 검색 API](https://serpapi.com/search-api)
 - [SerpApi Baidu 검색 API](https://serpapi.com/baidu-search-api)
 
-문서 확인 기준: 2026-10-19. 자동 테스트 61개로 파싱·페이지 처리·인증 대기 후 재개·예약 수집의 인증 필요 처리·키 없는 설정·기존 DB 전환·세션 재사용을 검증했습니다. 실제 Edge의 로컬 DevTools 연결과 1MiB 응답 수신도 확인했습니다. 새 세션 수집의 현재 네트워크 실측은 Google/Baidu 모두 인증 필요 상태였으며, 사람의 CAPTCHA 인증 완료 후 실제 검색 성공은 아직 검증하지 못했습니다. 보고서는 `test-artifacts/browser-session-probe/report.json`입니다. 이전 테스트에서 HTML 파싱은 Google 9건·Baidu 8건을 확인했지만 현재 차단 해제 성공을 의미하지 않습니다. API 수집은 유료 키 없이 fixture로 검증했습니다.
+문서 확인 기준: 2026-10-20. R3 자동 테스트 84개를 통과했습니다. 모델 선택, 입력 궤적 범위, 지연된 승인 복귀, 인증 응답의 승인 여부·토큰 비기록을 포함합니다. 초기 배포본·R2·R3의 CAPTCHA 통과·검색 수신·인증 거부는 각 시험 보고서에 구분해 기록했습니다. 실제 Edge의 로컬 DevTools 연결과 1MiB 응답 수신도 확인했습니다. API 수집은 유료 키 없이 fixture로 검증했습니다.
 
 참고: [Google 비정상 트래픽·직접 CAPTCHA 인증 안내](https://support.google.com/websearch/answer/86640?hl=ko), [Microsoft Edge DevTools Protocol](https://learn.microsoft.com/en-us/microsoft-edge/devtools/protocol/).
 

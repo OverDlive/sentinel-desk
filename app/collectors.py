@@ -196,6 +196,8 @@ class Collectors:
                         browser_session=bool(config.get("browser_session") and self.use_browser),
                         search_url=url, display_url=item.get("display_url", ""),
                         redirect_unresolved=urlsplit(item["url"]).hostname in ("www.baidu.com", "baidu.com", "www.google.com", "google.com"))
+                    if provider in self.browser_sessions:
+                        finding["evidence"]["captcha_attempts"] = self.browser_sessions[provider].captcha_attempts
                     yield finding
             if not more:
                 return "검색 완료 · HTML 직접 수집 · 검색 색인 후보"

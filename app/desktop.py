@@ -7,9 +7,11 @@ import tkinter as tk
 from datetime import datetime, timedelta, timezone
 from tkinter import filedialog, messagebox, ttk, font as tkfont
 import webbrowser
+from .captcha_runtime import runtime_status
 
 from .domain import PROVIDER_MAP, SEVERITIES
 from .reporting import export_csv
+from .windowing import show_centered
 
 from .ui import BG, WHITE, NAVY, TEAL, TEXT, MUTED, LINE, SOFT, GREEN, AMBER, install_theme, AutoScrollbar, ResultList, Button, TableFrame, bind_resize, bind_wrap, CanvasLayout
 
@@ -505,19 +507,25 @@ class Desktop:
         if selected:
             self.finding_detail(int(selected[0]))
 
+    def popup(self, title):
+        win = tk.Toplevel(self.root)
+        win.withdraw()
+        win.title(title)
+        win.configure(bg=BG)
+        win.transient(self.root)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<MouseWheel>", self.scroll_wheel, add="+")
+        return win
+
     def finding_detail(self, finding_id):
         item = self.store.detail(finding_id)
         if not item:
             return
-        win = tk.Toplevel(self.root)
-        win.title("검색 결과 상세 · 검토")
-        win.geometry("960x780")
-        win.minsize(800, 650)
-        win.configure(bg=BG)
-        win.transient(self.root)
-        win.bind("<Escape>", lambda e: win.destroy())
+        win = self.popup("검색 결과 상세 · 검토")
         body = ttk.Frame(win, padding=22)
         body.pack(fill="both", expand=True)
+        # Reserve the footer before allocating the expanding notebook.
+        Button(body, text="닫기", command=win.destroy).pack(side="bottom", anchor="e", pady=(12, 0))
         ttk.Label(body, text=item["title"], font=("맑은 고딕", 15, "bold"), wraplength=880).pack(anchor="w")
         ttk.Label(body, text=f"{'데모' if item['mode']=='demo' else '실제 수집'}  ·  {SEV_LABEL[item['severity']]} 위험 후보  ·  신뢰도 {item['confidence']}  ·  {KIND_LABEL[item['kind']]}",
                   foreground=TEAL).pack(anchor="w", pady=(7, 12))
@@ -538,15 +546,18 @@ class Desktop:
                 f"관측 시각: {sight['observed_at'] or '미제공'}\n수집: {local_time(sight['first_seen'])} ~ {local_time(sight['last_seen'])} · {sight['count']}회\n"
                 + json.dumps(sight["evidence"], ensure_ascii=False, indent=2) + "\n\n")
         text.configure(state="disabled")
-        ttk.Label(evidence_tab, text="검색 대상 URL은 자동 방문·다운로드하지 않습니다. 피싱 후보 주소도 자동으로 열지 않습니다.", style="Muted.TLabel", wraplength=850).pack(anchor="w", pady=(10, 0))
+        ttk.Label(evidence_tab, text="검색 대상 URL은 자동 방문·다운로드하지 않습니다. 피싱 후보 주소도 자동으로 열지 않습니다.", style="Muted.TLabel", wraplength=850).pack(side="bottom", before=text.master, anchor="w", pady=(10, 0))
         status = tk.StringVar(value=STATUS_LABEL[item["status"]])
         owner = tk.StringVar(value=item["owner"])
-        ttk.Label(review_tab, text="검토 상태").pack(anchor="w", pady=(0, 6))
-        ttk.Combobox(review_tab, textvariable=status, values=list(STATUS_LABEL.values()), state="readonly", width=30).pack(anchor="w")
-        ttk.Label(review_tab, text="담당자 / 부서").pack(anchor="w", pady=(15, 6))
-        ttk.Entry(review_tab, textvariable=owner, width=50).pack(anchor="w")
-        ttk.Label(review_tab, text="검토 근거·조치 메모").pack(anchor="w", pady=(15, 6))
-        note = self.text_area(review_tab, height=8)
+        review_outer, review_body = self.scroll_panel(review_tab, padding=0)
+        review_body.configure(style="TFrame")
+        review_outer.pack(fill="both", expand=True)
+        ttk.Label(review_body, text="검토 상태").pack(anchor="w", pady=(0, 6))
+        ttk.Combobox(review_body, textvariable=status, values=list(STATUS_LABEL.values()), state="readonly", width=30).pack(anchor="w")
+        ttk.Label(review_body, text="담당자 / 부서").pack(anchor="w", pady=(15, 6))
+        ttk.Entry(review_body, textvariable=owner, width=50).pack(fill="x")
+        ttk.Label(review_body, text="검토 근거·조치 메모").pack(anchor="w", pady=(15, 6))
+        note = self.text_area(review_body, height=8)
         note.insert("1.0", item["note"])
         def save():
             try:
@@ -556,12 +567,13 @@ class Desktop:
                 self.refresh()
             except ValueError as exc:
                 messagebox.showerror("저장 실패", str(exc), parent=win)
-        Button(review_tab, text="검토 저장", style="Primary.TButton", command=save).pack(anchor="e", pady=14)
+        # Keep actions outside the scrollable form, including at high DPI.
+        Button(review_tab, text="검토 저장", style="Primary.TButton", command=save).pack(side="bottom", before=review_outer, anchor="e", pady=14)
         history = self.text_area(history_tab)
         for event in item["events"]:
             history.insert("end", f"{local_time(event['created_at'])}  {event['message']}\n\n")
         history.configure(state="disabled")
-        Button(body, text="닫기", command=win.destroy).pack(anchor="e", pady=(12, 0))
+        show_centered(win, (960, 780), (800, 650))
 
     def text_area(self, parent, height=12):
         frame = ttk.Frame(parent)
@@ -620,12 +632,9 @@ class Desktop:
         if target and target["demo"]:
             messagebox.showinfo("예시 대상", "데모 대상은 수정할 수 없습니다. 실제 점검 대상을 새로 등록하세요.", parent=self.root)
             return
-        win = tk.Toplevel(self.root)
-        win.title("점검 대상 수정" if target else "점검 대상 등록")
-        win.geometry("750x790")
-        win.configure(bg=BG)
-        win.transient(self.root)
-        win.bind("<Escape>", lambda e: win.destroy())
+        win = self.popup("점검 대상 수정" if target else "점검 대상 등록")
+        footer = ttk.Frame(win, padding=(22, 10, 22, 16))
+        footer.pack(side="bottom", fill="x")
         outer, body = self.scroll_panel(win, padding=22)
         outer.pack(fill="both", expand=True)
         ttk.Label(body, style="Card.TLabel", text="기관과 점검 범위", font=("맑은 고딕", 17, "bold")).pack(anchor="w")
@@ -648,7 +657,9 @@ class Desktop:
         enabled = tk.BooleanVar(value=(target or {}).get("enabled", True))
         ttk.Checkbutton(body, text="수집 대상 활성화", variable=enabled).pack(anchor="w", pady=15)
         error = tk.StringVar()
-        ttk.Label(body, textvariable=error, foreground="#b24735", background=WHITE, wraplength=680).pack(anchor="w")
+        error_label = ttk.Label(footer, textvariable=error, foreground="#b24735", wraplength=680)
+        error_label.pack(fill="x")
+        bind_wrap(footer, [error_label])
         def save():
             if not self.guard_edit():
                 return
@@ -660,7 +671,9 @@ class Desktop:
                 self.notify("점검 대상과 검색 규칙을 저장했습니다.")
             except ValueError as exc:
                 error.set(str(exc))
-        Button(body, text="대상 저장·규칙 생성", style="Primary.TButton", command=save).pack(anchor="e", pady=15)
+        Button(footer, text="닫기", command=win.destroy).pack(side="left", pady=(8, 0))
+        Button(footer, text="대상 저장·규칙 생성", style="Primary.TButton", command=save).pack(side="right", pady=(8, 0))
+        show_centered(win, (750, 790), (600, 400))
 
     def delete_target(self, tree):
         if not self.guard_edit() or not tree.selection():
@@ -720,6 +733,8 @@ class Desktop:
             label("검색 수집 방식")
             selector = ttk.Combobox(body, textvariable=backend, values=list(backend_labels), state="readonly")
             selector.pack(fill="x", pady=(0, 10))
+            model_name = "Breaking-reCAPTCHAv2" if provider_id == "google" else "ConvNeXt + RotNetR"
+            label(f"자동 CAPTCHA 모델: {model_name} · {runtime_status(provider_id)}", wraplength=480, font=("맑은 고딕", 9))
             label("직접 수집: 앱 전용 Edge 세션을 재사용합니다. 수집 실행을 직접 누르면 Edge 창이 열립니다. 인증 화면은 직접 완료하면 자동 재개합니다(최대 5분). 예약 실행은 창 없이 수집하며 인증 필요 시 이력에 표시합니다. 요청 사이 최소 10초 간격입니다.", wraplength=480, font=("맑은 고딕", 9))
         if provider["needs_key"] or provider_id in ("google", "baidu"):
             key_label = "SerpApi API 키" if provider_id in ("google", "baidu", "zoneh", "xssed") else "API 키 / PAT"
@@ -792,17 +807,30 @@ class Desktop:
         def inspect(e):
             if tree.selection():
                 rule = next(r for r in rules if r["id"] == int(tree.selection()[0]))
-                win = tk.Toplevel(self.root)
-                win.title("검색 규칙")
-                win.geometry("720x360")
-                body = ttk.Frame(win, padding=20)
-                body.pack(fill="both", expand=True)
-                text = self.text_area(body)
-                text.insert("1.0", f"목적: {rule['label']}\n원본 표: {rule['source_row']}\n\n검색식:\n{rule['query']}\n\n최근 실행: {local_time(rule['last_run'])}")
-                text.configure(state="disabled")
-                if not PROVIDER_MAP[rule["provider"]]["supported"]:
-                    Button(body, text="서비스 수동 확인 ↗", command=lambda: webbrowser.open(PROVIDER_MAP[rule["provider"]]["docs"])).pack(anchor="e", pady=10)
+                self.rule_detail(rule)
         tree.bind("<Double-1>", inspect)
+
+    def text_dialog(self, title, content, action=None):
+        win = self.popup(title)
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill="both", expand=True)
+        footer = ttk.Frame(body)
+        footer.pack(side="bottom", fill="x", pady=(10, 0))
+        Button(footer, text="닫기", command=win.destroy).pack(side="left")
+        if action:
+            label, command = action
+            Button(footer, text=label, command=command).pack(side="right")
+        text = self.text_area(body)
+        text.insert("1.0", content)
+        text.configure(state="disabled")
+        show_centered(win, (720, 360), (480, 240))
+        return win
+
+    def rule_detail(self, rule):
+        provider = PROVIDER_MAP[rule["provider"]]
+        action = None if provider["supported"] else ("서비스 수동 확인 ↗", lambda: webbrowser.open(provider["docs"]))
+        return self.text_dialog("검색 규칙",
+            f"목적: {rule['label']}\n원본 표: {rule['source_row']}\n\n검색식:\n{rule['query']}\n\n최근 실행: {local_time(rule['last_run'])}", action)
 
     def show_runs(self):
         data = self.store.overview(self.mode.get())
@@ -836,7 +864,7 @@ class Desktop:
             select()
         def detail(e):
             if details.selection():
-                messagebox.showinfo("규칙 실행 상세", "\n\n".join(str(x) for x in details.item(details.selection()[0], "values")), parent=self.root)
+                self.text_dialog("규칙 실행 상세", "\n\n".join(str(x) for x in details.item(details.selection()[0], "values")))
         details.bind("<Double-1>", detail)
         ttk.Label(self.content, text="관측 건수는 출처별 수집 횟수입니다. 중복 통합 후 결과 개수와 다를 수 있습니다.", style="Muted.TLabel").pack(anchor="w", pady=10)
 
