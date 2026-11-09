@@ -31,6 +31,10 @@ BAIDU = '''<html><title>百度搜索</title><body><div id="content_left">
 
 
 class ParserTests(unittest.TestCase):
+    def test_empty_page_with_js_fallback_is_complete_zero(self):
+        html = '<meta content="0;url=/httpservice/retry/enablejs"><p>Your search did not match any documents.</p><a href="/search?q=Acme&start=10">next</a>'
+        self.assertEqual(parse_search_html(html, 'google'), ([], False))
+
     def test_google_entities_redirect_duplicate_ads_and_next(self):
         items, more = parse_search_html(GOOGLE, "google")
         self.assertTrue(more)

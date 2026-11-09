@@ -177,6 +177,8 @@ class SearchSession:
             stable = None
             attempted = False
             approval_deadline = None
+            render_pending = False
+            render_reloaded = False
             while not self.stop.is_set():
                 snapshot = self.snapshot()
                 if snapshot.get("oversized"):
@@ -204,6 +206,15 @@ class SearchSession:
                     stable = signature
                 except SearchPageError as exc:
                     stable, last_error = None, exc
+                    if exc.code == "render_required" and snapshot.get("ready") == "complete":
+                        if render_pending and not render_reloaded:
+                            # Reload the same app-owned search page once after
+                            # two complete snapshots; keep query/auth boundaries.
+                            self.client.call("Page.reload", dict(ignoreCache=True), session=self.session)
+                            render_reloaded = True
+                            load_deadline = time.monotonic() + 40
+                            self.progress(f"{self.engine}: JavaScript 검색 페이지 다시 불러오는 중")
+                        render_pending = True
                     challenge = exc.code == "blocked" or current.path.startswith("/sorry") or current.hostname in ("wappass.baidu.com", "passport.baidu.com", "consent.google.com")
                     if challenge:
                         if not attempted and self.auto_captcha and self.endpoint and self.target_id:
@@ -232,7 +243,8 @@ class SearchSession:
                 if time.monotonic() >= deadline:
                     if auth_deadline:
                         raise RenderError("브라우저 인증 대기 시간이 끝났습니다. 인증 후 수집을 다시 실행하세요.", "auth_required")
-                    raise RenderError(str(last_error) if last_error else "검색 결과 로딩 시간이 초과되었습니다.", "schema")
+                    code = "render_required" if last_error and last_error.code == "render_required" else "schema"
+                    raise RenderError(str(last_error) if last_error else "검색 결과 로딩 시간이 초과되었습니다.", code)
                 self.stop.wait(0.5)
             raise RenderError("사용자가 수집을 중지했습니다.", "cancelled")
         except (DevToolsError, OSError, TimeoutError):

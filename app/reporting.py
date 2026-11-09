@@ -15,6 +15,8 @@ def export_csv(store, path, mode, filters):
                ("reason", "판정 근거"), ("first_seen", "최초 수집 UTC"), ("last_seen", "최근 수집 UTC"),
                ("observed_at", "제공자 관측 시각"), ("change_count", "변경 횟수"), ("owner", "담당자"), ("note", "메모")]
     count, offset = 0, 0
+    if filters.get("run_id") not in (None, ""):
+        columns = [("run_id", "실행 번호"), ("run_label", "해당 실행에서"), ("run_started", "실행 시작 UTC"), *columns]
     with open(path, "w", newline="", encoding="utf-8-sig") as output:
         writer = csv.writer(output)
         writer.writerow(["데이터 모드", *[label for _, label in columns]])

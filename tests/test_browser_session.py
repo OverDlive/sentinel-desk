@@ -80,6 +80,22 @@ class BrowserSessionTests(unittest.TestCase):
                 session.results(URL)
         self.assertEqual(error.exception.code, "schema")
 
+    def test_complete_enablejs_page_reloads_once_then_collects(self):
+        pending = snapshot('<meta content="0;url=/httpservice/retry/enablejs">')
+        session = self.session([pending, pending, snapshot(GOOGLE), snapshot(GOOGLE)])
+        with patch.object(session.stop, 'wait', return_value=False):
+            self.assertEqual(len(session.results(URL)[0]), 1)
+        self.assertEqual([c.args[0] for c in session.client.call.call_args_list], ['Page.navigate', 'Page.reload'])
+
+    def test_persistent_enablejs_is_not_misreported_as_schema_or_zero_results(self):
+        pending = snapshot('<meta content="0;url=/httpservice/retry/enablejs">')
+        session = self.session([pending, pending, pending])
+        with patch.object(session.stop, 'wait', return_value=False), patch('app.search_browser.time.monotonic', side_effect=[0, 0, 0, 100]):
+            with self.assertRaises(RenderError) as error:
+                session.results(URL)
+        self.assertEqual(error.exception.code, 'render_required')
+        self.assertEqual(sum(c.args[0] == 'Page.reload' for c in session.client.call.call_args_list), 1)
+
     def test_verification_redirect_is_waitable(self):
         session = self.session([snapshot("<html>verification</html>", "https://wappass.baidu.com/static/captcha"), snapshot(GOOGLE), snapshot(GOOGLE)])
         with patch.object(session.stop, "wait", return_value=False):

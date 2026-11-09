@@ -3,7 +3,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from .collectors import CollectionError, Collectors
-from .domain import now
+from .domain import SEARCH_PROVIDERS, now
 from .demo import demo_findings
 
 
@@ -44,7 +44,7 @@ class Engine:
                 if not any(p["enabled"] and p["supported"] for p in self.store.providers()):
                     raise ValueError("API 연동에서 하나 이상의 제공자를 활성화하세요.")
             with self.store.db() as db:
-                run_id = db.execute("INSERT INTO runs(mode,status,trigger,started_at) VALUES (?,'running',?,?)", (mode, trigger, now())).lastrowid
+                run_id = db.execute("INSERT INTO runs(mode,status,trigger,started_at,result_index) VALUES (?,'running',?,?,'exact')", (mode, trigger, now())).lastrowid
             self.cancel.clear()
             self.progress = ""
             self.active_id = run_id
@@ -70,7 +70,7 @@ class Engine:
                 for provider, rule, finding in demo_findings(target):
                     if self.cancel.is_set():
                         break
-                    added, changed = self.store.upsert_finding(target["id"], mode, provider, rule, finding)
+                    added, changed = self.store.upsert_finding(target["id"], mode, provider, rule, finding, run_id=run_id)
                     new_count += added
                     changed_count += changed
                     result_count += 1
@@ -92,12 +92,15 @@ class Engine:
                 collector.interactive = trigger == "manual"
                 collector.progress = lambda message: setattr(self, "progress", message)
                 blocked = set()
+                blocked_search_engines = set()
                 for rule in rules:
                     if self.cancel.is_set():
                         break
                     provider, count = rule["provider"], 0
-                    if provider in blocked:
-                        self.add_step(run_id, provider, rule["target_id"], rule, "skipped", 0, "앞선 접근 차단·응답 오류·권한·호출 제한으로 이번 실행에서 건너뜀")
+                    direct = provider in SEARCH_PROVIDERS and configs[provider].get("search_backend") == "direct_html"
+                    search_engine = ("baidu" if provider == "baidu" else "google") if direct else None
+                    if provider in blocked or search_engine in blocked_search_engines:
+                        self.add_step(run_id, provider, rule["target_id"], rule, "skipped", 0, "앞선 제공자 또는 공유 검색엔진의 접근 차단·응답 오류·권한·호출 제한으로 이번 실행에서 건너뜀")
                         skipped += 1
                         continue
                     try:
@@ -108,7 +111,7 @@ class Engine:
                             except StopIteration as end:
                                 note = end.value or "수집 완료"
                                 break
-                            added, changed = self.store.upsert_finding(rule["target_id"], mode, provider, rule, finding)
+                            added, changed = self.store.upsert_finding(rule["target_id"], mode, provider, rule, finding, run_id=run_id)
                             new_count += added
                             changed_count += changed
                             result_count += 1
@@ -122,6 +125,8 @@ class Engine:
                         self.add_step(run_id, provider, rule["target_id"], rule, "partial" if count else exc.code, count, str(exc))
                         if exc.code in ("auth", "quota", "rate_limited", "blocked", "auth_required") or (exc.code == "schema" and configs[provider].get("search_backend") == "direct_html"):
                             blocked.add(provider)
+                        if direct and exc.code in ("blocked", "auth_required", "schema", "rate_limited"):
+                            blocked_search_engines.add(search_engine)
                     except Exception:
                         failures += 1
                         self.add_step(run_id, provider, rule["target_id"], rule, "error", count,

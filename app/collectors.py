@@ -1,16 +1,19 @@
 """Passive collection from provider APIs and search HTML, never target pages."""
 import gzip
+import hashlib
+import ipaddress
 import io
 import json
 import re
 import socket
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .domain import host_matches, ip_matches, now, web_finding
+from .domain import ARCHIVE_HOSTS, SEARCH_PROVIDERS, host_matches, ip_matches, now, web_finding
 from .search_html import SearchPageError, parse_search_html
 from .search_browser import RenderError, render_search, SearchSession
 from .devtools import DevToolsError
@@ -35,7 +38,7 @@ class Transport:
         self.store, self.stop = store, stop
         self.opener = build_opener(SameHostRedirect())
 
-    def fetch(self, provider, url, headers=None, body=None, compressed=False, limit=8 * 1024 * 1024, response_format="json"):
+    def fetch(self, provider, url, headers=None, body=None, compressed=False, limit=8 * 1024 * 1024, response_format="json", operation=""):
         headers = dict(headers or {})
         headers.setdefault("User-Agent", "SentinelDesk/1.0 (passive exposure monitoring)")
         headers.setdefault("Accept", "application/json")
@@ -44,12 +47,16 @@ class Transport:
         payload = json.dumps(body).encode() if body is not None else None
         if payload is not None:
             headers["Content-Type"] = "application/json"
-        attempts = 1 if response_format == "html" else 2
+        lookup = provider == "censys" and operation == "lookup"
+        attempts = 1 if response_format == "html" or lookup else 2
         for attempt in range(attempts):
             if self.stop.is_set():
                 raise CollectionError("사용자가 수집을 중지했습니다.", "cancelled")
-            if not self.store.claim_request(provider):
-                raise CollectionError("애플리케이션 일일 호출 한도에 도달했습니다. 한도는 UTC 00:00에 초기화됩니다.", "quota")
+            claimed = self.store.claim_request(provider, operation=operation) if lookup else self.store.claim_request(provider)
+            if not claimed:
+                message = ("앱 일일 호출 또는 Censys 월간 조회 상한에 도달했습니다. 월간 상한은 UTC 매월 1일에 초기화됩니다."
+                           if lookup else "애플리케이션 일일 호출 한도에 도달했습니다. 한도는 UTC 00:00에 초기화됩니다.")
+                raise CollectionError(message, "quota")
             try:
                 request = Request(url, headers=headers, data=payload)
                 with self.opener.open(request, timeout=20) as response:
@@ -68,9 +75,16 @@ class Transport:
                             return raw.decode(charset, errors="replace")
                         except LookupError:
                             raise CollectionError("검색 HTML 문자 인코딩을 인식하지 못했습니다.", "schema") from None
-                    return json.loads(raw)
+                    data = json.loads(raw)
+                    if lookup and not isinstance(data, dict):
+                        raise CollectionError("Censys 개별 호스트 JSON 응답이 객체가 아닙니다.", "schema")
+                    return data
             except HTTPError as exc:
                 # Never persist response bodies or request URLs: these can contain API keys.
+                if lookup and exc.code == 404:
+                    return None  # No observed host; not an authentication or parsing failure.
+                if provider == "censys" and exc.code == 402:
+                    raise CollectionError("Censys 크레딧이 부족합니다. 계정 잔액과 갱신 시점을 확인하세요.", "quota") from None
                 if exc.code in (401, 403):
                     if response_format == "html":
                         raise CollectionError(f"HTTP {exc.code}: 검색엔진이 직접 수집 접근을 거부했습니다.", "blocked") from None
@@ -124,6 +138,7 @@ class Collectors:
         self.transport = transport or Transport(store, stop)
         self.memory = {}
         self.html_last_request = None
+        self.censys_last_request = None
         self.browser_sessions = {}
         self.interactive = False
         self.progress = lambda _message: None
@@ -138,20 +153,21 @@ class Collectors:
         self.browser_sessions.clear()
 
     def html_items(self, provider, url, page, config):
+        engine = "baidu" if provider == "baidu" else "google"
         if config.get("browser_session") and self.use_browser:
             if not self.store.claim_request(provider):
                 raise CollectionError("애플리케이션 일일 호출 한도에 도달했습니다.", "quota")
-            if provider not in self.browser_sessions:
-                self.browser_sessions[provider] = SearchSession(self.store.directory, provider, self.stop,
+            if engine not in self.browser_sessions:
+                self.browser_sessions[engine] = SearchSession(self.store.directory, engine, self.stop,
                     interactive=self.interactive, progress=self.progress)
             try:
-                return self.browser_sessions[provider].results(url, page * 10)
+                return self.browser_sessions[engine].results(url, page * 10)
             except (RenderError, DevToolsError, OSError, TimeoutError) as exc:
                 raise CollectionError(str(exc) if isinstance(exc, RenderError) else "검색 브라우저 연결에 실패했습니다.",
                                       getattr(exc, "code", "blocked")) from None
         html = self.transport.fetch(provider, url, headers={"Accept": "text/html", "Accept-Language": "ko,en;q=0.8,zh;q=0.7"}, response_format="html")
         try:
-            return parse_search_html(html, provider, page * 10)
+            return parse_search_html(html, engine, page * 10)
         except SearchPageError as exc:
             if exc.code != "render_required":
                 raise CollectionError(str(exc), exc.code) from None
@@ -160,7 +176,7 @@ class Collectors:
             if not self.store.claim_request(provider):
                 raise CollectionError("애플리케이션 일일 호출 한도에 도달했습니다.", "quota")
             try:
-                return parse_search_html(render_search(url, self.stop), provider, page * 10)
+                return parse_search_html(render_search(url, self.stop), engine, page * 10)
             except SearchPageError as rendered:
                 raise CollectionError(str(rendered), "blocked" if rendered.code in ("blocked", "render_required") else rendered.code) from None
             except (RenderError, OSError, TimeoutError) as rendered:
@@ -168,6 +184,7 @@ class Collectors:
 
     def collect_html(self, rule, target, config):
         provider = rule["provider"]
+        engine = "baidu" if provider == "baidu" else "google"
         seen = set()
         for page in range(config["pages"]):
             # Shared spacing also covers consecutive rules and the two engines.
@@ -177,7 +194,7 @@ class Collectors:
                     raise CollectionError("사용자가 수집을 중지했습니다.", "cancelled")
             if self.stop.is_set():
                 raise CollectionError("사용자가 수집을 중지했습니다.", "cancelled")
-            if provider == "google":
+            if engine == "google":
                 url = "https://www.google.com/search?" + urlencode(dict(q=rule["query"], hl="ko", gl="kr", start=page * 10))
             else:
                 url = "https://www.baidu.com/s?" + urlencode(dict(wd=rule["query"], pn=page * 10, rn=10))
@@ -192,16 +209,85 @@ class Collectors:
                     continue
                 if finding and finding["identity"] not in seen:
                     seen.add(finding["identity"])
-                    finding["evidence"].update(search_engine=provider, collection_method="direct_html",
+                    finding["evidence"].update(search_engine=engine, collection_method="direct_html",
                         browser_session=bool(config.get("browser_session") and self.use_browser),
                         search_url=url, display_url=item.get("display_url", ""),
                         redirect_unresolved=urlsplit(item["url"]).hostname in ("www.baidu.com", "baidu.com", "www.google.com", "google.com"))
-                    if provider in self.browser_sessions:
-                        finding["evidence"]["captcha_attempts"] = self.browser_sessions[provider].captcha_attempts
+                    if engine in self.browser_sessions:
+                        finding["evidence"]["captcha_attempts"] = self.browser_sessions[engine].captcha_attempts
                     yield finding
             if not more:
                 return "검색 완료 · HTML 직접 수집 · 검색 색인 후보"
         return "페이지 상한 도달 · 추가 검색 결과가 남아 있을 수 있습니다."
+
+    @staticmethod
+    def censys_host(data, ip):
+        if data is None:
+            return None
+        result = data.get("result") if isinstance(data, dict) else None
+        host = result.get("resource") if isinstance(result, dict) else None
+        try:
+            valid_ip = isinstance(host, dict) and ipaddress.ip_address(host.get("ip", "")) == ipaddress.ip_address(ip)
+        except ValueError:
+            valid_ip = False
+        if not valid_ip or not isinstance(host.get("services"), list):
+            raise CollectionError("Censys 개별 호스트 응답의 IP 또는 서비스 목록이 올바르지 않습니다.", "schema")
+        for service in host["services"]:
+            if not isinstance(service, dict) or type(service.get("port")) is not int or not 1 <= service["port"] <= 65535:
+                raise CollectionError("Censys 개별 호스트 응답의 서비스 포트가 올바르지 않습니다.", "schema")
+        return host
+
+    def collect_censys_lookup(self, rule, target, config):
+        match = re.fullmatch(r'host\.ip:\s*"([^"]+)"', rule["query"])
+        try:
+            network = ipaddress.ip_network(match[1]) if match else None
+        except ValueError:
+            network = None
+        if network is None or str(network) not in target["cidrs"]:
+            raise CollectionError("Censys 개별 조회는 등록된 CIDR의 자동 생성 규칙에만 사용할 수 있습니다.", "schema")
+        size = network.num_addresses
+        maximum = min(size, max(1, min(100, int(config.get("lookup_limit", 10)))))
+        start = self.store.censys_cursor(target["id"], str(network)) % size
+        account = hashlib.sha256(config["key"].encode()).hexdigest()
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="microseconds")
+        cached_count = missing_count = 0
+        for index in range(maximum):
+            if self.stop.is_set():
+                raise CollectionError("사용자가 수집을 중지했습니다.", "cancelled")
+            position = (start + index) % size
+            ip = str(network[position])
+            self.progress(f"Censys 개별 IP 조회: {ip} ({index + 1}/{maximum})")
+            cached = self.store.censys_cached_host(account, ip, since)
+            if cached:
+                data, fetched_at = cached
+                cached_count += 1
+            else:
+                # No organization ID: explicitly use the personal Free wallet.
+                if self.censys_last_request is not None and self.stop.wait(max(0, 0.05 - (time.monotonic() - self.censys_last_request))):
+                    raise CollectionError("사용자가 수집을 중지했습니다.", "cancelled")
+                try:
+                    data = self.transport.fetch("censys", "https://api.platform.censys.io/v3/global/asset/host/" + quote(ip, safe=""),
+                        headers={"Authorization": "Bearer " + config["key"], "Accept": "application/vnd.censys.api.v3.host.v1+json"},
+                        operation="lookup")
+                finally:
+                    self.censys_last_request = time.monotonic()
+                self.censys_host(data, ip)  # Never cache malformed/mismatched responses.
+                fetched_at = self.store.cache_censys_host(account, ip, data)
+            host = self.censys_host(data, ip)
+            if host is None:
+                missing_count += 1
+            else:
+                for service in host["services"] or [{"port": 0, "protocol": "호스트 (서비스 상세 없음)"}]:
+                    finding = service_finding(ip, service, "censys", service.get("scan_time") or host.get("last_updated_at"))
+                    finding["evidence"].update(collection_method="host_lookup", cache_hit=bool(cached),
+                        fetched_at=fetched_at, scope_cidr=str(network),
+                        classification="Censys 무료 개별 IP 관측 조회. CIDR 검색·실시간 스캔·취약점 확정이 아닙니다.")
+                    yield finding
+            self.store.censys_cursor(target["id"], str(network), (position + 1) % size)
+        note = f"개별 IP {maximum}개 처리 · 24시간 캐시 {cached_count}개 · 미관측(404) {missing_count}개"
+        if maximum < size:
+            return note + " · 규칙당 IP 상한 도달 · 다음 실행에 이어서 순환 조회합니다."
+        return note + " · 등록 CIDR의 IP 처리 완료 · Censys 관측 데이터 기준"
 
     def feed(self, provider, config):
         if provider in self.memory:
@@ -237,11 +323,13 @@ class Collectors:
 
     def collect(self, rule, target, config):
         provider = rule["provider"]
-        if provider in ("google", "baidu") and config.get("search_backend", "direct_html") == "direct_html":
+        if provider in SEARCH_PROVIDERS and config.get("search_backend", "direct_html") == "direct_html":
             return (yield from self.collect_html(rule, target, config))
-        if provider in ("google", "baidu", "zoneh", "xssed"):
+        if provider == "censys" and config.get("censys_mode", "search") == "lookup":
+            return (yield from self.collect_censys_lookup(rule, target, config))
+        if provider in SEARCH_PROVIDERS:
             engine = "baidu" if provider == "baidu" else "google"
-            archive_host = {"zoneh": "zone-h.org", "xssed": "xssed.com"}.get(provider)
+            archive_host = ARCHIVE_HOSTS.get(provider)
             for page in range(config["pages"]):
                 params = dict(engine=engine, q=rule["query"], api_key=config["key"])
                 params["pn" if engine == "baidu" else "start"] = page * 10

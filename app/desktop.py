@@ -9,7 +9,7 @@ from tkinter import filedialog, messagebox, ttk, font as tkfont
 import webbrowser
 from .captcha_runtime import runtime_status
 
-from .domain import PROVIDER_MAP, SEVERITIES
+from .domain import PROVIDER_MAP, SEARCH_PROVIDERS, SEVERITIES
 from .reporting import export_csv
 from .windowing import show_centered
 
@@ -32,7 +32,7 @@ class RoundedPanel(tk.Frame):
         bind_resize(self, draw, size=True)
 
 SEV_LABEL = dict(critical="긴급", high="높음", medium="중간", low="낮음", info="정보")
-STATUS_LABEL = dict(new="신규", reviewing="검토 중", confirmed="영향 확인", in_progress="조치 중",
+STATUS_LABEL = dict(new="미검토", reviewing="검토 중", confirmed="영향 확인", in_progress="조치 중",
                     resolved="조치 완료", false_positive="오탐 / 정상 공개", accepted="위험 수용")
 KIND_LABEL = dict(config="설정·백업", document="공개 문서", paste="유출 의심", brand="기관 언급",
                   service="외부 서비스", phishing="피싱 후보", advisory="취약점 권고", archive="신고 이력 후보")
@@ -57,6 +57,8 @@ class Desktop:
         self.view = "overview"
         self.offset = 0
         self.filters = {}
+        self.result_scope = "all"
+        self.selected_run_id = None
         self.last_signature = None
         self.nav_buttons = {}
         self.root.title("Sentinel Desk | 외부 노출·취약점 후보 모니터링")
@@ -211,6 +213,8 @@ class Desktop:
             button.configure(style="Soft.TButton" if key == mode else "TButton")
         self.last_signature = None
         self.offset, self.filters = 0, {}
+        self.result_scope = "latest" if mode == "real" else "all"
+        self.selected_run_id = None
         self.mode_label.configure(text="●  DEMO · 합성 예시" if mode == "demo" else "●  LIVE · 실제 수집",
                                   fg=AMBER if mode == "demo" else GREEN, bg="#fff3e2" if mode == "demo" else "#eaf6f1")
         self.navigate(self.view)
@@ -248,6 +252,9 @@ class Desktop:
     def run_collection(self):
         try:
             run_id = self.engine.start(self.mode.get())
+            self.result_scope, self.selected_run_id = "latest", None
+            self.filters, self.offset = {}, 0
+            self.navigate("findings")
             self.notify(f"실행 #{run_id} 시작 · {'데모: 실제 API 호출 없음' if self.mode.get() == 'demo' else '실제 API 수집 중'}")
         except ValueError as exc:
             messagebox.showinfo("수집 준비", str(exc), parent=self.root)
@@ -321,6 +328,7 @@ class Desktop:
         outer, body = self.scroll_panel(self.content, padding=0)
         outer.pack(fill="both", expand=True)
         body.configure(style="TFrame")
+        self.run_context(body, controls=False)
         hero = RoundedPanel(body, color=SOFT, padding=16)
         hero.pack(fill="x", pady=(0, 16))
         hero_left = tk.Frame(hero.body, bg=SOFT)
@@ -337,7 +345,7 @@ class Desktop:
         bind_wrap(hero_left, hero_left.winfo_children())
         strip = ttk.Frame(body)
         strip.pack(fill="x", pady=(0, 16))
-        cards = [("전체 수집 결과", data["total"], "출처별 중복 통합", TEAL, WHITE),
+        cards = [("전체 누적 결과", data["total"], "모든 실행 · 중복 통합", TEAL, WHITE),
                  ("검토·조치 필요", data["open"], "완료·오탐·수용 제외", TEXT, WHITE),
                  ("높은 위험 후보", data["high"], "검증 전 · 우선 확인", "#b95b50", "#fff0ec"),
                  ("오늘 신규 발견", data["new_today"], "UTC 일자 기준", GREEN, "#eaf6f1")]
@@ -429,15 +437,87 @@ class Desktop:
         box.pack(side="left", padx=(0, 7))
         return variable, mapping
 
+    def result_run(self):
+        if self.result_scope == "all":
+            return None
+        return self.store.run_summary(self.mode.get(), self.selected_run_id if self.result_scope == "selected" else None)
+
+    def result_filters(self):
+        filters = dict(self.filters)
+        if self.result_scope != "all":
+            run = self.result_run()
+            filters["run_id"] = run["id"] if run else -1
+        return filters
+
+    def open_run_results(self, run_id=None):
+        self.result_scope = "selected" if run_id is not None else "latest"
+        self.selected_run_id = run_id
+        self.filters, self.offset = {}, 0
+        self.navigate("findings")
+
+    def run_context(self, parent, controls=True):
+        panel = RoundedPanel(parent, color=SOFT, padding=12)
+        panel.pack(fill="x", pady=(0, 12))
+        run = self.result_run() if controls else self.store.run_summary(self.mode.get())
+        if controls:
+            row = tk.Frame(panel.body, bg=SOFT)
+            row.pack(fill="x")
+            def scope(value):
+                self.result_scope, self.selected_run_id, self.offset = value, None, 0
+                self.navigate("findings")
+            Button(row, text="최근 실행", style="Primary.TButton" if self.result_scope == "latest" else "TButton", command=lambda: scope("latest")).pack(side="left", padx=(0, 8))
+            Button(row, text="전체 누적", style="Primary.TButton" if self.result_scope == "all" else "TButton", command=lambda: scope("all")).pack(side="left", padx=(0, 8))
+            runs = self.store.runs(self.mode.get())
+            options = {f"#{r['id']} · {local_time(r['started_at'])} · {RUN_LABEL.get(r['status'], r['status'])}": r["id"] for r in runs[:50]}
+            selected = next((label for label, value in options.items() if run and value == run["id"]), "과거 실행 선택")
+            variable = tk.StringVar(value=selected if self.result_scope != "all" else "과거 실행 선택")
+            selector = ttk.Combobox(row, textvariable=variable, values=list(options), state="readonly", width=38)
+            selector.pack(side="left")
+            selector.bind("<<ComboboxSelected>>", lambda e: self.open_run_results(options[variable.get()]))
+            self.flow_row(row)
+        if controls and self.result_scope == "all":
+            heading = "전체 누적 결과 · 모든 실행에서 발견한 후보"
+            detail = "과거 결과도 포함합니다. 검토 상태 ‘미검토’는 이번 실행의 신규 발견 여부와 별개입니다."
+        elif run:
+            prefix = "최근 실행" if not controls or self.result_scope == "latest" else "선택한 과거 실행"
+            heading = f"{prefix} #{run['id']} · {local_time(run['started_at'])} · {RUN_LABEL.get(run['status'], run['status'])}"
+            detail = f"중복 통합 {run['unique_count']}건 · 이번 신규 {run['indexed_new']} · 기존 재수집 {run['repeated_count']} · 내용 변경 {run['indexed_changed']}"
+            if run["result_index"] == "legacy":
+                detail = f"연결된 후보 {run['unique_count']}건 · 최초 발견 {run['indexed_new']} · 기존 관측 {run['unique_count']-run['indexed_new']}  |  당시 변경 기록 {run['changed_count']}회"
+            if run["status"] in ("partial", "failed", "cancelled", "interrupted"):
+                detail += "  |  수집 범위 제한/중단 · 이력 확인"
+            if run["result_index"] == "legacy":
+                detail += "\n과거 기록: 저장 시각으로 확인되는 결과만 연결했습니다. 일부 결과와 당시 분류는 복원되지 않을 수 있습니다."
+        else:
+            heading, detail = "아직 수집 실행 기록이 없습니다", "수집을 실행하면 해당 실행의 결과를 별도로 볼 수 있습니다."
+        title = tk.Label(panel.body, text=heading, bg=SOFT, fg=TEXT, anchor="w", justify="left", font=("맑은 고딕", 10, "bold"))
+        title.pack(fill="x", pady=(4, 2))
+        note = tk.Label(panel.body, text=detail, bg=SOFT, fg=MUTED, anchor="w", justify="left", font=("맑은 고딕", 9), wraplength=700)
+        note.pack(fill="x")
+        bind_wrap(panel.body, (title, note))
+        if not controls and run:
+            Button(panel.body, text="최근 실행 결과 보기 →", command=lambda: self.open_run_results()).pack(anchor="w", pady=(8, 0))
+
     def show_findings(self):
-        row = ttk.Frame(self.content)
+        filters_outer, filters_body = self.scroll_panel(self.content, padding=0)
+        filters_body.configure(style="TFrame")
+        filters_outer.pack(fill="x")
+        filters_outer.grid_propagate(False)
+        def fit_controls(width, height):
+            wanted = max(70, min(filters_body.winfo_reqheight(), int(height * .58)))
+            if filters_outer.winfo_reqheight() != wanted:
+                filters_outer.configure(height=wanted)
+        bind_resize(filters_outer, lambda w, h: fit_controls(self.content.winfo_width(), self.content.winfo_height()), size=True)
+        filters_body.bind("<Configure>", lambda e: fit_controls(self.content.winfo_width(), self.content.winfo_height()), add="+")
+        self.run_context(filters_body)
+        row = ttk.Frame(filters_body)
         row.pack(fill="x", pady=(0, 9))
         q = tk.StringVar(value=self.filters.get("q", ""))
         ttk.Label(row, text="검색어", style="Muted.TLabel").pack(side="left", padx=(0, 8))
         self.search_entry = ttk.Entry(row, textvariable=q, width=29)
         self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         controls = []
-        filter_row = ttk.Frame(self.content)
+        filter_row = ttk.Frame(filters_body)
         filter_row.pack(fill="x", pady=(0, 12))
         for field, labels, width in [("severity", {v: k for k, v in SEV_LABEL.items()}, 10),
             ("status", {v: k for k, v in STATUS_LABEL.items()}, 15),
@@ -459,7 +539,7 @@ class Desktop:
             if isinstance(control, ttk.Combobox):
                 control.bind("<<ComboboxSelected>>", lambda e: apply())
         self.flow_row(filter_row)
-        second = ttk.Frame(self.content)
+        second = ttk.Frame(filters_body)
         second.pack(fill="x", pady=(0, 12))
         targets = {"전체 점검 대상": "", **{t["name"] + f" (#{t['id']})": str(t["id"]) for t in self.store.targets(demo=self.mode.get() == "demo")}}
         target_var = tk.StringVar(value=next((k for k,v in targets.items() if v == self.filters.get("target_id", "")), "전체 점검 대상"))
@@ -475,17 +555,18 @@ class Desktop:
         detail_button.pack(side="right", padx=8)
         detail_button.state(["disabled"])
         self.flow_row(second)
-        page = self.store.findings(self.mode.get(), dict(self.filters, offset=self.offset, limit=25))
-        tree = self.table(self.content, [("severity", "위험도", 75), ("title", "제목", 330), ("target", "대상", 120),
-            ("asset", "자산", 170), ("kind", "유형", 100), ("sources", "출처", 140), ("status", "상태", 130), ("seen", "최근 수집", 120)])
+        page = self.store.findings(self.mode.get(), dict(self.result_filters(), offset=self.offset, limit=25))
+        scoped = self.result_scope != "all"
+        tree = self.table(self.content, ([("run_state", "해당 실행에서", 115)] if scoped else []) + [("severity", "위험도", 75), ("title", "제목", 330), ("target", "대상", 120),
+            ("asset", "자산", 170), ("kind", "유형", 100), ("sources", "출처", 140), ("status", "검토 상태 (현재)", 140), ("seen", "실행 시각" if scoped else "최근 수집 (누적)", 140)])
         for item in page["items"]:
-            tree.insert("", "end", iid=str(item["id"]), values=(SEV_LABEL[item["severity"]], item["title"], item["target_name"],
-                item["asset"], KIND_LABEL[item["kind"]], ", ".join(item["sources"]), STATUS_LABEL[item["status"]], local_time(item["last_seen"])), tags=(item["severity"],))
+            tree.insert("", "end", iid=str(item["id"]), values=((item.get("run_label", ""),) if scoped else ()) + (SEV_LABEL[item["severity"]], item["title"], item["target_name"],
+                item["asset"], KIND_LABEL[item["kind"]], ", ".join(item["sources"]), STATUS_LABEL[item["status"]], local_time(item["run_started"] if scoped else item["last_seen"])), tags=(item["severity"],))
         tree.bind("<Double-1>", lambda e: self.open_selected(tree))
         tree.bind("<Return>", lambda e: self.open_selected(tree))
         tree.bind("<<TreeviewSelect>>", lambda e: detail_button.state(["!disabled"] if tree.selection() else ["disabled"]))
         footer = ttk.Frame(self.content)
-        footer.pack(side="bottom", before=tree.master, fill="x", pady=12)
+        footer.pack(side="bottom", before=filters_outer, fill="x", pady=12)
         self.pagination = footer
         ttk.Label(footer, text=f"총 {page['total']}건 · {min(self.offset + 1, page['total'])}–{self.offset + len(page['items'])} 표시", style="Muted.TLabel").pack(side="left")
         def move(delta):
@@ -500,7 +581,10 @@ class Desktop:
         if not self.offset:
             prev_button.state(["disabled"])
         if not page["total"]:
-            ttk.Label(footer, text="  대상과 API를 등록하고 수집을 실행하세요.", foreground=TEAL).pack(side="left")
+            if scoped:
+                tree.empty.configure(text="선택한 실행에 연결된 결과가 없습니다.\n실행 상태와 오류는 수집 이력에서 확인하세요.")
+            else:
+                tree.empty.configure(text="검색 조건에 맞는 누적 결과가 없습니다.\n필터를 조정하거나 수집을 실행하세요.")
 
     def open_selected(self, tree):
         selected = tree.selection()
@@ -518,12 +602,17 @@ class Desktop:
         return win
 
     def finding_detail(self, finding_id):
-        item = self.store.detail(finding_id)
+        run = self.result_run() if self.view == "findings" else None
+        item = self.store.detail(finding_id, run_id=run["id"] if run else None)
         if not item:
             return
         win = self.popup("검색 결과 상세 · 검토")
         body = ttk.Frame(win, padding=22)
         body.pack(fill="both", expand=True)
+        if run:
+            basis = "발견 정보는 해당 실행 기준" if run["result_index"] == "exact" else "과거 시각 연결 · 발견 정보는 현재 보관값"
+            ttk.Label(body, text=f"실행 #{run['id']} · {local_time(run['started_at'])} · {basis} / 검토 상태는 현재 기준",
+                      foreground=TEAL, wraplength=850).pack(anchor="w", pady=(0, 8))
         # Reserve the footer before allocating the expanding notebook.
         Button(body, text="닫기", command=win.destroy).pack(side="bottom", anchor="e", pady=(12, 0))
         ttk.Label(body, text=item["title"], font=("맑은 고딕", 15, "bold"), wraplength=880).pack(anchor="w")
@@ -537,10 +626,13 @@ class Desktop:
         tabs.add(history_tab, text="변경·처리 이력")
         text = self.text_area(evidence_tab)
         header = (f"자산: {item['asset']}\nURL: {item['url']}\n분류 근거: {item['reason']}\n"
-                  f"최초 수집: {local_time(item['first_seen'])}\n최근 수집: {local_time(item['last_seen'])}\n"
+                  f"최초 수집 (누적): {local_time(item['first_seen'])}\n최근 수집 (누적): {local_time(item['last_seen'])}\n"
                   f"제공자 관측: {item['observed_at'] or '제공되지 않음'}\nCVE: {', '.join(item['cves']) or '없음'}\n"
-                  f"내용 변경: {item['change_count']}회\n\n{item['summary']}\n\n")
+                  f"내용 변경 (누적): {item['change_count']}회\n\n{item['summary']}\n\n")
         text.insert("end", header)
+        if item.get("run_evidence"):
+            text.insert("end", "해당 실행의 원본 증거\n" + json.dumps(item["run_evidence"], ensure_ascii=False, indent=2) + "\n\n")
+        text.insert("end", "전체 출처 이력 (다른 실행도 포함)\n")
         for sight in item["sightings"]:
             text.insert("end", f"{'─'*48}\n출처: {PROVIDER_MAP[sight['provider']]['name']}\n검색어: {sight['query']}\n"
                 f"관측 시각: {sight['observed_at'] or '미제공'}\n수집: {local_time(sight['first_seen'])} ~ {local_time(sight['last_seen'])} · {sight['count']}회\n"
@@ -592,7 +684,7 @@ class Desktop:
         path = filedialog.asksaveasfilename(parent=self.root, title="검색 결과 CSV 내보내기", defaultextension=".csv",
             initialfile=f"sentinel-{self.mode.get()}-{datetime.now():%Y%m%d}.csv", filetypes=[("Excel 호환 CSV", "*.csv")])
         if path:
-            count = export_csv(self.store, path, self.mode.get(), self.filters)
+            count = export_csv(self.store, path, self.mode.get(), self.result_filters())
             self.notify(f"현재 필터의 결과 {count}건을 CSV로 저장했습니다.")
 
     def show_targets(self):
@@ -694,6 +786,7 @@ class Desktop:
         paned.add(left, weight=2)
         paned.add(provider_outer, weight=3)
         tree = self.table(left, [("name", "제공자", 145), ("enabled", "상태", 90), ("key", "API 키", 90), ("usage", "요청 / 일", 100)])
+        self.provider_tree = tree
         for provider in self.store.providers():
             state = "사용 중" if provider["enabled"] else "꺼짐" if provider["supported"] else "미지원"
             tree.insert("", "end", iid=provider["id"], values=(provider["name"], state,
@@ -729,21 +822,22 @@ class Desktop:
         clear_key = tk.BooleanVar(value=False)
         backend_labels = {"HTML 직접 수집 (키 불필요)": "direct_html", "SerpApi (API 키 필요)": "serpapi"}
         backend = tk.StringVar(value=next(k for k, v in backend_labels.items() if v == provider["search_backend"]))
-        if provider_id in ("google", "baidu"):
+        if provider_id in SEARCH_PROVIDERS:
             label("검색 수집 방식")
             selector = ttk.Combobox(body, textvariable=backend, values=list(backend_labels), state="readonly")
             selector.pack(fill="x", pady=(0, 10))
-            model_name = "Breaking-reCAPTCHAv2" if provider_id == "google" else "ConvNeXt + RotNetR"
-            label(f"자동 CAPTCHA 모델: {model_name} · {runtime_status(provider_id)}", wraplength=480, font=("맑은 고딕", 9))
-            label("직접 수집: 앱 전용 Edge 세션을 재사용합니다. 수집 실행을 직접 누르면 Edge 창이 열립니다. 인증 화면은 직접 완료하면 자동 재개합니다(최대 5분). 예약 실행은 창 없이 수집하며 인증 필요 시 이력에 표시합니다. 요청 사이 최소 10초 간격입니다.", wraplength=480, font=("맑은 고딕", 9))
-        if provider["needs_key"] or provider_id in ("google", "baidu"):
-            key_label = "SerpApi API 키" if provider_id in ("google", "baidu", "zoneh", "xssed") else "API 키 / PAT"
-            label(key_label + ("  ·  기존 키가 암호화되어 저장되어 있습니다." if provider["has_key"] else "  ·  SerpApi 선택 시 필요" if provider_id in ("google", "baidu") else "  ·  등록 필요"), wraplength=480)
-            if provider_id in ("google", "baidu", "zoneh", "xssed"):
+            search_engine = "baidu" if provider_id == "baidu" else "google"
+            model_name = "ConvNeXt + RotNetR" if search_engine == "baidu" else "Breaking-reCAPTCHAv2"
+            label(f"자동 CAPTCHA 모델: {model_name} · {runtime_status(search_engine)}", wraplength=480, font=("맑은 고딕", 9))
+            label("직접 수집: 앱 전용 Edge 세션을 재사용합니다. Google·Zone-H·XSSed는 Google 세션을 공유합니다. 인증 화면은 직접 완료하면 자동 재개합니다(최대 5분). 예약 실행도 전용 Edge 창을 사용하며 인증 필요 시 이력에 표시합니다. 요청 사이 최소 10초 간격입니다.", wraplength=480, font=("맑은 고딕", 9))
+        if provider["needs_key"] or provider_id in SEARCH_PROVIDERS:
+            key_label = "SerpApi API 키" if provider_id in SEARCH_PROVIDERS else "API 키 / PAT"
+            label(key_label + ("  ·  기존 키가 암호화되어 저장되어 있습니다." if provider["has_key"] else "  ·  SerpApi 선택 시 필요" if provider_id in SEARCH_PROVIDERS else "  ·  등록 필요"), wraplength=480)
+            if provider_id in SEARCH_PROVIDERS:
                 label("동일한 SerpApi 키를 각 항목에 등록할 수 있습니다. 네 항목의 제공자 크레딧은 공유되며 아래 앱 호출 상한은 항목별입니다.", wraplength=480, font=("맑은 고딕", 9))
             entry = ttk.Entry(body, textvariable=key, show="●")
             entry.pack(fill="x")
-            if provider_id in ("google", "baidu"):
+            if provider_id in SEARCH_PROVIDERS:
                 def update_key_state(_event=None):
                     entry.configure(state="disabled" if backend_labels[backend.get()] == "direct_html" else "normal")
                 selector.bind("<<ComboboxSelected>>", update_key_state)
@@ -752,17 +846,40 @@ class Desktop:
             show = tk.BooleanVar(value=False)
             ttk.Checkbutton(body, text="입력 중인 키 표시", variable=show, command=lambda: entry.configure(show="" if show.get() else "●")).pack(anchor="w", pady=5)
             ttk.Checkbutton(body, text="기존 키 삭제", variable=clear_key).pack(anchor="w", pady=5)
-            label("키를 삭제하려면 먼저 실제 수집 사용을 해제하세요.", wraplength=480, font=("맑은 고딕", 9))
+            label("키가 필요한 방식에서 키를 삭제하려면 실제 수집 사용을 먼저 해제하세요.", wraplength=480, font=("맑은 고딕", 9))
         organization = tk.StringVar(value=provider["organization_id"])
+        censys_modes = {"무료 계정 · 개별 IP 조회 (PAT 필요)": "lookup", "유료 계정 · CIDR 검색": "search"}
+        censys_mode = tk.StringVar(value=next(k for k, v in censys_modes.items() if v == provider["censys_mode"]))
+        lookup_limit = tk.StringVar(value=str(provider["lookup_limit"]))
+        monthly_limit = tk.StringVar(value=str(provider["monthly_limit"]))
         if provider_id == "censys":
-            label("Organization ID (선택)")
-            ttk.Entry(body, textvariable=organization).pack(fill="x", pady=(0, 12))
+            label("Censys 수집 방식")
+            mode_selector = ttk.Combobox(body, textvariable=censys_mode, values=list(censys_modes), state="readonly")
+            mode_selector.pack(fill="x", pady=(0, 12))
+            label("규칙당 처리할 IP 수 (무료 조회 · 1~100)")
+            lookup_entry = ttk.Spinbox(body, from_=1, to=100, textvariable=lookup_limit, width=15)
+            lookup_entry.pack(anchor="w", pady=(0, 12))
+            label("앱 월간 조회 요청 상한 (UTC 월 · 1~100)")
+            month_entry = ttk.Spinbox(body, from_=1, to=100, textvariable=monthly_limit, width=15)
+            month_entry.pack(anchor="w", pady=(0, 12))
+            label(f"이번 달 앱 개별 조회 요청: {provider['used_month']}회. 24시간 캐시는 요청 수에 포함하지 않습니다. 다른 앱·웹 사용량과 실제 크레딧 잔액은 포함하지 않습니다. 실패한 요청도 보수적으로 계산합니다.", wraplength=480, font=("맑은 고딕", 9))
+            label("무료 조회는 등록 CIDR의 IP를 순환 처리합니다. 기본값은 규칙당 10개·월 100회이며 IP가 더 남으면 이력에 부분 수집으로 표시합니다. 무료 조회에서는 Organization ID를 전송하지 않습니다.", wraplength=480, font=("맑은 고딕", 9))
+            label("Organization ID (유료 검색용 · 선택)")
+            org_entry = ttk.Entry(body, textvariable=organization)
+            org_entry.pack(fill="x", pady=(0, 12))
+            def update_censys_state(_event=None):
+                lookup = censys_modes[censys_mode.get()] == "lookup"
+                for widget in (lookup_entry, month_entry):
+                    widget.configure(state="normal" if lookup else "disabled")
+                org_entry.configure(state="disabled" if lookup else "normal")
+            mode_selector.bind("<<ComboboxSelected>>", update_censys_state)
+            update_censys_state()
         label("일일 HTTP 요청 상한 (UTC 일자 · 제공자 과금 크레딧과 다름)", wraplength=480)
         limit = tk.StringVar(value=str(provider["daily_limit"]))
         ttk.Spinbox(body, from_=1, to=10000, textvariable=limit, width=15).pack(anchor="w", pady=(0, 12))
         pages = tk.StringVar(value=str(provider["pages"]))
         if provider_id not in ("cisa", "phishtank"):
-            label("규칙당 최대 페이지 (1~3)")
+            label("규칙당 최대 페이지 (1~3)" + (" · 유료 검색에 적용" if provider_id == "censys" else ""))
             ttk.Spinbox(body, from_=1, to=3, textvariable=pages, width=15).pack(anchor="w", pady=(0, 12))
         label(f"오늘 요청: {provider['used_today']}회  ·  재시도도 요청 수에 포함합니다.", wraplength=480, font=("맑은 고딕", 9))
         error = tk.StringVar()
@@ -773,7 +890,8 @@ class Desktop:
             try:
                 self.store.save_provider(provider_id, dict(enabled=enabled.get(), key=key.get(), clear_key=clear_key.get(),
                     daily_limit=int(limit.get()), pages=int(pages.get()), organization_id=organization.get(),
-                    search_backend=backend_labels[backend.get()]))
+                    search_backend=backend_labels[backend.get()], censys_mode=censys_modes[censys_mode.get()],
+                    lookup_limit=int(lookup_limit.get()), monthly_limit=int(monthly_limit.get())))
                 key.set("")
                 self.notify(f"{provider['name']} 설정 저장 완료")
                 self.show_providers_refresh(provider_id)
@@ -783,6 +901,9 @@ class Desktop:
 
     def show_providers_refresh(self, provider_id):
         self.refresh()
+        self.provider_tree.selection_set(provider_id)
+        self.provider_tree.focus(provider_id)
+        self.provider_tree.see(provider_id)
         self.provider_form(provider_id)
 
     def show_rules(self):
@@ -834,6 +955,9 @@ class Desktop:
 
     def show_runs(self):
         data = self.store.overview(self.mode.get())
+        actions = ttk.Frame(self.content)
+        actions.pack(fill="x", pady=(0, 8))
+        Button(actions, text="선택 실행 결과 보기 →", command=lambda: self.open_run_results(int(tree.selection()[0])) if tree.selection() else None).pack(anchor="w")
         paned = ttk.Panedwindow(self.content, orient="vertical")
         paned.pack(fill="both", expand=True)
         upper, lower = ttk.Frame(paned), ttk.Frame(paned)

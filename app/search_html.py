@@ -155,6 +155,10 @@ def parse_search_html(html, engine, offset=0):
     empty = any(x in lower for x in ("did not match any documents", "no results found for", "找不到和您的查询", "没有找到与", "未找到相关结果", "일치하는 검색결과가 없습니다", "검색어와 일치하는 문서가 없습니다"))
     if not items and blocked:
         raise SearchPageError("검색엔진의 CAPTCHA·접근 확인 화면입니다.", "blocked")
+    if not items and empty:
+        # A genuine empty page may still contain Google's enable-JS fallback
+        # metadata and navigation links. Neither is a collection failure/page.
+        return [], False
     if not items and engine == "google" and any(n.tag == "meta" and "/httpservice/retry/enablejs" in (n.attrs.get("content") or "") for n in nodes):
         raise SearchPageError("Google 검색에 JavaScript 렌더링이 필요합니다.", "render_required")
     if not items and not empty:

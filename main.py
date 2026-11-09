@@ -122,7 +122,7 @@ def smoke_ui(root, app, path):
     app.store.save_provider("brave", dict(enabled=False, clear_key=True))
     keyless_saved = True
     backend_switch = True
-    for provider_id in ("google", "baidu"):
+    for provider_id in ("google", "baidu", "zoneh", "xssed"):
         app.provider_form(provider_id)
         root.update()
         selector = next(w for w in descendants(app.provider_form_area) if w.winfo_class() == "TCombobox")
@@ -141,6 +141,32 @@ def smoke_ui(root, app, path):
         config = next(p for p in app.store.providers() if p["id"] == provider_id)
         keyless_saved = keyless_saved and config["enabled"] and not config["needs_key"] and config["search_backend"] == "direct_html"
         app.store.save_provider(provider_id, dict(enabled=False))
+    app.provider_form("censys")
+    root.update()
+    selector = next(w for w in descendants(app.provider_form_area) if w.winfo_class() == "TCombobox")
+    selector.current(0)
+    selector.event_generate("<<ComboboxSelected>>")
+    entries = [w for w in descendants(app.provider_form_area) if w.winfo_class() == "TEntry"]
+    entries[0].insert(0, "ui-synthetic-censys-pat")
+    censys_mode_switch = str(entries[1].cget("state")) == "disabled"
+    spins = [w for w in descendants(app.provider_form_area) if w.winfo_class() == "TSpinbox"]
+    for widget, value in zip(spins, (7, 40)):
+        widget.delete(0, "end")
+        widget.insert(0, str(value))
+    check = next(w for w in descendants(app.provider_form_area) if w.winfo_class() == "TCheckbutton" and w.cget("text") == "실제 수집에 사용")
+    if not next(p for p in app.store.providers() if p["id"] == "censys")["enabled"]:
+        check.invoke()
+    invoke(app.provider_form_area, "연동 설정 저장")
+    config = next(p for p in app.store.providers() if p["id"] == "censys")
+    censys_mode_switch = censys_mode_switch and config["enabled"] and config["has_key"] and config["censys_mode"] == "lookup" and config["lookup_limit"] == 7 and config["monthly_limit"] == 40
+    selector = next(w for w in descendants(app.provider_form_area) if w.winfo_class() == "TCombobox")
+    selector.current(1)
+    selector.event_generate("<<ComboboxSelected>>")
+    entries = [w for w in descendants(app.provider_form_area) if w.winfo_class() == "TEntry"]
+    censys_mode_switch = censys_mode_switch and str(entries[1].cget("state")) == "normal"
+    invoke(app.provider_form_area, "연동 설정 저장")
+    censys_mode_switch = censys_mode_switch and next(p for p in app.store.providers() if p["id"] == "censys")["censys_mode"] == "search"
+    app.store.save_provider("censys", dict(enabled=False, clear_key=True, censys_mode="lookup", lookup_limit=10, monthly_limit=100))
     app.switch_mode("demo")
     run_id = app.engine.start("demo")
     # Keep Tk dispatching during worker completion (including widget finalizers).
@@ -153,11 +179,19 @@ def smoke_ui(root, app, path):
             root.after(50, wait_for_demo)
     root.after(50, wait_for_demo)
     root.mainloop()
+    app.open_run_results(run_id)
+    root.update()
+    run_scope_checked = app.result_filters().get("run_id") == run_id and app.store.findings("demo", app.result_filters())["total"] == 10
+    invoke(root, "전체 누적")
+    all_scope_checked = "run_id" not in app.result_filters()
+    app.open_run_results(run_id)
+    invoke(root, "필터 초기화")
+    scope_survives_reset = app.result_filters().get("run_id") == run_id
     app.navigate("runs")
     root.update()
     overview = app.store.overview("demo")
-    ok = not failures and minimum_layout and search_shortcut and search_applied and filters_reset and scoped_enter and review_saved and target_saved and key_saved and keyless_saved and backend_switch and overview["runs"][0]["status"] == "success"
-    report = dict(ok=ok, keyless_saved=keyless_saved, backend_switch=backend_switch, views=views, search_shortcut=search_shortcut, search_applied=search_applied,
+    ok = not failures and run_scope_checked and all_scope_checked and scope_survives_reset and minimum_layout and search_shortcut and search_applied and filters_reset and scoped_enter and review_saved and target_saved and key_saved and keyless_saved and backend_switch and censys_mode_switch and overview["runs"][0]["status"] == "success"
+    report = dict(ok=ok, run_scope_checked=run_scope_checked, all_scope_checked=all_scope_checked, scope_survives_reset=scope_survives_reset, keyless_saved=keyless_saved, backend_switch=backend_switch, censys_mode_switch=censys_mode_switch, views=views, search_shortcut=search_shortcut, search_applied=search_applied,
                   filters_reset=filters_reset, enter_scoped_to_search=scoped_enter, minimum_size_checked="1100x740", minimum_layout_visible=minimum_layout, dialogs=["finding_detail", "target_form"], callback_errors=failures,
                   review_saved=review_saved, target_saved=target_saved, encrypted_key_saved=key_saved,
                   provider_forms_checked=len(app.store.providers()), demo_run_id=run_id,

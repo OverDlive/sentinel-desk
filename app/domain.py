@@ -3,7 +3,7 @@ import ipaddress
 import json
 import re
 from datetime import datetime, timezone
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 CONFIG_EXTS = "conf cnf reg inf rdp cfg txt ora ini bak".split()
 DOC_EXTS = "xls xlsx ppt pptx doc docx hwp pdf".split()
@@ -16,6 +16,8 @@ CISA_SEARCH_SCOPES = (
 )
 SEVERITIES = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 STATUSES = {"new", "reviewing", "confirmed", "in_progress", "resolved", "false_positive", "accepted"}
+SEARCH_PROVIDERS = ("google", "baidu", "zoneh", "xssed")
+ARCHIVE_HOSTS = {"zoneh": "zone-h.org", "xssed": "xssed.com"}
 PROVIDERS = [
     dict(id="brave", name="Brave Search", category="웹 검색", needs_key=True, supported=True,
          description="설정·문서·브랜드·Pastebin·CISA 권고/분석 보고서 색인 검색. Google과 다른 독립 검색 색인입니다.",
@@ -24,7 +26,7 @@ PROVIDERS = [
          description="등록 CIDR의 기존 관측 데이터 및 CVE 후보. 능동 스캔을 요청하지 않습니다.",
          docs="https://developer.shodan.io/api"),
     dict(id="censys", name="Censys", category="외부 서비스", needs_key=True, supported=True,
-         description="Platform v3 / CenQL. 검색 권한이 포함된 PAT가 필요합니다.",
+         description="무료 계정 PAT로 등록 CIDR의 IP를 순환 조회합니다. 유료 CenQL 검색 모드도 선택할 수 있습니다. 무료 조회는 24시간 캐시와 앱 월간 요청 상한을 적용합니다.",
          docs="https://docs.censys.com/reference/get-started"),
     dict(id="phishtank", name="PhishTank", category="피싱 피드", needs_key=True, supported=True,
          description="검증된 활성 피싱 DB에서 브랜드 문자열 대조. 전체 DB는 1시간 캐시합니다.",
@@ -39,10 +41,10 @@ PROVIDERS = [
          description="기관·브랜드·이메일 도메인 검색. HTML 직접 수집은 API 키 없이 Baidu에 검색어를 전송합니다. SerpApi 수집도 선택할 수 있습니다.",
          docs="https://www.baidu.com/"),
     dict(id="zoneh", name="Zone-H (색인)", category="신고 이력 색인", needs_key=True, supported=True,
-         description="SerpApi / Google의 zone-h.org 색인에서 신고 이력 후보를 수집합니다. SerpApi 키 필요. 원본 DB 전체 조회가 아니며 과거 신고는 현재 침해의 증거가 아닙니다.",
+         description="키 없는 Google 직접 수집 / SerpApi 선택. zone-h.org 색인의 신고 이력 후보이며 원본 DB 전체 조회나 현재 침해 확인이 아닙니다.",
          docs="https://serpapi.com/search-api"),
     dict(id="xssed", name="XSSed (색인)", category="신고 이력 색인", needs_key=True, supported=True,
-         description="SerpApi / Google의 xssed.com 색인에서 XSS 신고 이력 후보를 수집합니다. SerpApi 키 필요. 색인 누락·오래된 신고가 있을 수 있으며 현재 취약점을 확정하지 않습니다.",
+         description="키 없는 Google 직접 수집 / SerpApi 선택. xssed.com 색인의 XSS 신고 이력 후보이며 색인 누락·오래된 신고가 있을 수 있습니다. 현재 취약점을 확정하지 않습니다.",
          docs="https://serpapi.com/search-api"),
 ]
 PROVIDER_MAP = {x["id"]: x for x in PROVIDERS}
@@ -176,6 +178,17 @@ def compile_rules(target):
     return rules
 
 
+def search_identity(url, title, description, display_url=""):
+    """Group identical unresolved search evidence, never infer a final URL."""
+    parts = urlsplit(url)
+    engine = "google" if parts.hostname in ("google.com", "www.google.com") and parts.path == "/goto" else (
+        "baidu" if parts.hostname in ("baidu.com", "www.baidu.com") and parts.path == "/link" else None)
+    if engine and description.strip():
+        evidence = [engine] + [re.sub(r"\s+", " ", str(value)).strip() for value in (title, description, display_url)]
+        return "search-evidence:" + digest(evidence)
+    return "url:" + url
+
+
 def web_finding(item, rule, target):
     url = canonical_url(str(item.get("url", "")))
     title = str(item.get("title", ""))[:500] or url
@@ -188,6 +201,9 @@ def web_finding(item, rule, target):
     related = not redirect and host_matches(host, target["domains"])
     terms = target["keywords"] + [target["name"]]
     kind = rule["kind"]
+    archive_host = ARCHIVE_HOSTS.get(rule.get("provider")) if kind == "archive" else None
+    if archive_host and not host_matches(source_host, [archive_host]):
+        return None
     if kind in ("brand", "paste", "archive", "advisory"):
         terms += target["domains"]
     if kind == "paste" and not host_matches(source_host, ["pastebin.com"]):
@@ -200,7 +216,7 @@ def web_finding(item, rule, target):
     if not related and not keyword_match:
         return None
     severity = "high" if kind == "config" and related else "medium" if kind == "paste" else "info"
-    finding = dict(identity="url:" + url, url=url, asset=host, title=title, summary=description,
+    finding = dict(identity=search_identity(url, title, description, item.get("display_url", "")), url=url, asset=host, title=title, summary=description,
                 kind=kind, severity=severity, confidence="high" if related else "low",
                 reason="등록 도메인 일치" if related else "기관 키워드 일치 — 관련성 검토 필요",
                 observed_at=None, cves=[], evidence={"title": title, "description": description,
@@ -209,8 +225,21 @@ def web_finding(item, rule, target):
         finding["cves"] = sorted(set(c.upper() for c in re.findall(r"CVE-\d{4}-\d{4,}", title + " " + description, re.I)))
         finding["reason"] = "CISA 권고 색인에서 등록 키워드·제품·CVE 일치 · 실제 영향 확인 필요"
         finding["evidence"]["classification"] = "권고·분석 보고서의 검색 색인 후보. KEV 등재 또는 취약 버전 보유를 뜻하지 않습니다."
+    if archive_host:
+        finding["reason"] = "신고 이력 검색 색인에서 대상 문자열 일치 · 현재 영향 확인 필요"
+        finding["evidence"]["classification"] = "과거 신고의 검색 색인 후보. 원본 신고·현재 취약점은 확인하지 않았습니다."
     if redirect:
         finding["confidence"] = "low"
         finding["reason"] += " · 검색엔진 중계 링크: 최종 목적지 미확인"
         finding["evidence"].update(display_url=item.get("display_url", ""), redirect_unresolved=True)
+    if kind == "document":
+        # Search operators describe the request, not the returned resource.
+        # Only a resolved URL with a document suffix supports this category.
+        extension = unquote(urlsplit(url).path).rsplit("/", 1)[-1].rsplit(".", 1)[-1].lower()
+        if redirect or extension not in DOC_EXTS:
+            finding["kind"] = "brand"
+            finding["reason"] += " · 문서 형식 미확인 — 일반 검색 결과로 분류"
+            finding["evidence"]["classification"] = "기관 관련 검색 결과. 문서 형식·원문 내용·현재 접근 가능 여부는 확인하지 않았습니다."
+        else:
+            finding["evidence"]["classification"] = "URL 확장자에 따른 문서 후보. 실제 파일 형식·내용·현재 접근 가능 여부는 확인하지 않았습니다."
     return finding
